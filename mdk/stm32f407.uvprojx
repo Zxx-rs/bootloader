@@ -409,6 +409,11 @@
               <FileType>1</FileType>
               <FilePath>..\app\magic_header.c</FilePath>
             </File>
+            <File>
+              <FileName>boot_info.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\boot_info.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -428,6 +433,11 @@
               <FileName>bl_uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\driver\bl_uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>bl_eeprom.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\driver\bl_eeprom.c</FilePath>
             </File>
             <File>
               <FileName>console.c</FileName>
