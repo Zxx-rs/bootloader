@@ -1,0 +1,31 @@
+{
+    "configurations": [
+        {
+            "browse": {
+                "limitSymbolsToIncludedHeaders": true
+            },
+            "cStandard": "c99",
+            "compilerPath": "D:/BaiduNetdiskDownload/gcc-arm-none-eabi-10.3-2021.10-win32/gcc-arm-none-eabi-10.3-2021.10/bin/arm-none-eabi-gcc",
+            "cppStandard": "c++11",
+            "defines": [
+                "STM32F40_41xxx",
+                "USE_STDPERIPH_DRIVER",
+                "HSE_VALUE=8000000"
+            ],
+            "includePath": [
+            "app",
+            "driver",
+            "firmware/cmsis/core",
+            "firmware/cmsis/device",
+            "firmware/driver/inc",
+            "third_lib/crc",
+            "third_lib/easylogger",
+            "third_lib/ringbuffer"
+            ],
+            "intelliSenseMode": "windows-gcc-arm",
+            "name": "bootloader",
+            "mergeConfigurations": false
+        }
+    ],
+    "version": 4
+}
