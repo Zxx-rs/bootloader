@@ -6,6 +6,7 @@
 #include "board.h"
 #include "bl_uart.h"
 #include "bl_eeprom.h"
+#include "bl_w25q128.h"
 #include "boot_info.h"
 #include "tim_delay.h"
 #include "stm32_flash.h"
@@ -641,6 +642,13 @@ void bootloader_main(void)
 	if (!bl_eeprom_self_test())
 	{
 		log_e("EEPROM self-test FAILED");
+	}
+
+	/* 初始化 W25Q128 外挂 Flash (SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, PE13=CS) */
+	bl_w25q128_init();
+	if (!bl_w25q128_self_test())
+	{
+		log_e("W25Q128 self-test FAILED");
 	}
 	/* ──── 第一步：验证账本本身有没有坏 ──── */
 	boot_info_t boot_info;

@@ -440,6 +440,11 @@
               <FilePath>..\driver\bl_eeprom.c</FilePath>
             </File>
             <File>
+              <FileName>bl_w25q128.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\driver\bl_w25q128.c</FilePath>
+            </File>
+            <File>
               <FileName>console.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\driver\console.c</FilePath>
