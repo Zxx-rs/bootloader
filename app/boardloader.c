@@ -63,8 +63,9 @@ typedef enum
 	PACKET_OPCODE_ERASE = 0x81,	  // 擦除
 	PACKET_OPCODE_PROGRAM = 0x82, // 编程写入
 	PACKET_OPCODE_VERIFY = 0x83,  // 验证
-	PACKET_OPCODE_RESET = 0x21,	  // 复位
-	PACKET_OPCODE_BOOT = 0x22,	  // 引导跳转
+	PACKET_OPCODE_RESET    = 0x21,  // 复位
+	PACKET_OPCODE_BOOT     = 0x22,  // 引导跳转 (复位后由判决逻辑接管)
+	PACKET_OPCODE_SET_FLAG = 0x84,  // 写入 OTA 标志位 (boot_info)
 } packet_opcode_t;
 typedef enum
 {
@@ -160,9 +161,10 @@ static void bl_response(packet_opcode_t opcode, packet_errcode_t errcode, const 
 static void bl_opcode_inquery_handler(void)
 {
 	log_i("inquery handler");
-	if (packet_payload_length != 1) // 查询指令的有效载荷长度必须为1字节，表示查询子指令
+	if (packet_payload_length != 1)
 	{
 		log_e("inquery packet length error");
+		bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_PARAM, NULL, 0);
 		return;
 	}
 	uint8_t subcode = get_u8(packet_buffer + PACKET_PAYLOAD_OFFSET);
@@ -183,6 +185,7 @@ static void bl_opcode_inquery_handler(void)
 	default:
 	{
 		log_w("unknown inquery subcode: %02X", subcode);
+		bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_OPCODE, NULL, 0);
 		break;
 	}
 	}
@@ -190,39 +193,47 @@ static void bl_opcode_inquery_handler(void)
 
 static void bl_opcode_erase_handler(void)
 {
-	log_i("erase handler");
-	if (packet_payload_length != ADDR_SIZE_PARAM_LENGTH) // 擦除地址4字节+擦除大小4字节
+	log_i("erase handler (B: W25Q128)");
+	if (packet_payload_length != ADDR_SIZE_PARAM_LENGTH)
 	{
 		bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_PARAM, NULL, 0);
 		log_e("erase packet length error: %d", packet_payload_length);
 		return;
 	}
 	uint8_t *payload = packet_buffer + PACKET_PAYLOAD_OFFSET;
-	uint32_t address = get_u32_inc(&payload); // 从有效载荷中解析擦除地址和擦除大小
-	uint32_t size = get_u32_inc(&payload);
-	if (address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE) // 确保擦除地址范围在Flash范围内
+	uint32_t address = get_u32_inc(&payload);
+	uint32_t size    = get_u32_inc(&payload);
+
+	/* 验证地址在 W25Q128 范围内 */
+	if (address >= W25Q128_SIZE || address + size > W25Q128_SIZE)
 	{
-		log_e("erase address=0x%08X, size=%u out of range", address, size);
+		log_e("erase address=0x%08X, size=%u out of W25Q128 range", address, size);
 		bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_PARAM, NULL, 0);
 		return;
 	}
-	if (address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE) // 保护BootLoader区域不被擦除
+
+	log_i("erase B: 0x%08X ~ 0x%08X (%u bytes)", address, address + size - 1, size);
+
+	/* 向上对齐到扇区边界 (4KB), 逐个扇区擦除 */
+	uint32_t start_sector = address / W25Q128_SECTOR_SIZE;
+	uint32_t end_sector   = (address + size + W25Q128_SECTOR_SIZE - 1) / W25Q128_SECTOR_SIZE;
+	for (uint32_t sec = start_sector; sec < end_sector; sec++)
 	{
-		log_e("address 0x%08X is protected", address);
-		bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_PARAM, NULL, 0);
-		return;
+		if (!bl_w25q128_erase_sector(sec * W25Q128_SECTOR_SIZE))
+		{
+			log_e("erase B sector %u failed", sec);
+			bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_, NULL, 0);
+			return;
+		}
 	}
-	log_d("erase address=0x%08X, size=%u", address, size);
-	stm32_flash_unlock(); // 解锁
-	stm32_flash_erase(address, size); // 擦除
-	stm32_flash_lock(); // 锁定
+	log_i("erase B done: %u sector(s)", end_sector - start_sector);
 	bl_response(PACKET_OPCODE_ERASE, PACKET_ERRCODE_OK, NULL, 0);
 }
 
 static void bl_opcode_program_handler(void)
 {
-	log_i("program handler");
-	if (packet_payload_length <= ADDR_SIZE_PARAM_LENGTH) // 至少9个字节 = 写入地址4字节 + 写入大小4字节 + 写入数据
+	log_i("program handler (B: W25Q128)");
+	if (packet_payload_length <= ADDR_SIZE_PARAM_LENGTH)
 	{
 		bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_PARAM, NULL, 0);
 		log_e("program packet length error: %d", packet_payload_length);
@@ -230,37 +241,38 @@ static void bl_opcode_program_handler(void)
 	}
 	uint8_t *payload = packet_buffer + PACKET_PAYLOAD_OFFSET;
 	uint32_t address = get_u32_inc(&payload);
-	uint32_t size = get_u32_inc(&payload);
-	uint8_t *data = payload; // 指针指向写入数据的首地址
-	if (address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE)
+	uint32_t size    = get_u32_inc(&payload);
+	uint8_t *data    = payload;
+
+	/* 验证地址在 W25Q128 范围内 */
+	if (address >= W25Q128_SIZE || address + size > W25Q128_SIZE)
 	{
-		log_e("program address=0x%08X, size=%u out of range", address, size);
+		log_e("program address=0x%08X, size=%u out of W25Q128 range", address, size);
 		bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_PARAM, NULL, 0);
 		return;
 	}
-	if (address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE)
+
+	if (size != packet_payload_length - ADDR_SIZE_PARAM_LENGTH)
 	{
-		log_e("address 0x%08X is protected", address);
+		log_e("program size %u != payload %u", size, packet_payload_length - ADDR_SIZE_PARAM_LENGTH);
 		bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_PARAM, NULL, 0);
 		return;
 	}
-	if (size != packet_payload_length - ADDR_SIZE_PARAM_LENGTH) // 写入大小与有效载荷不匹配
+
+	if (!bl_w25q128_write(address, data, size))
 	{
-		log_e("program size %u does not match payload length %u", size, packet_payload_length - ADDR_SIZE_PARAM_LENGTH);
-		bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_PARAM, NULL, 0);
+		log_e("program B failed @ 0x%08X", address);
+		bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_, NULL, 0);
 		return;
 	}
-	log_i("program address=0x%08X, size=%u", address, size);
-	stm32_flash_unlock();
-	stm32_flash_program(address, data, size); // 执行写入操作
-	stm32_flash_lock();
+	log_i("program B: 0x%08X, %u bytes OK", address, size);
 	bl_response(PACKET_OPCODE_PROGRAM, PACKET_ERRCODE_OK, NULL, 0);
 }
 
 static void bl_opcode_verify_handler(void)
 {
-	log_i("Verify handler");
-	if (packet_payload_length != ADDR_SIZE_CRC_PARAM_LENGTH) // 校验起始地址+数据大小+32位校验值
+	log_i("verify handler (B: W25Q128)");
+	if (packet_payload_length != ADDR_SIZE_CRC_PARAM_LENGTH)
 	{
 		bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_PARAM, NULL, 0);
 		log_e("verify packet length error: %d", packet_payload_length);
@@ -268,22 +280,51 @@ static void bl_opcode_verify_handler(void)
 	}
 	uint8_t *payload = packet_buffer + PACKET_PAYLOAD_OFFSET;
 	uint32_t address = get_u32_inc(&payload);
-	uint32_t size = get_u32_inc(&payload);
-	uint32_t crc = get_u32_inc(&payload);
-	if (address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE)
+	uint32_t size    = get_u32_inc(&payload);
+	uint32_t crc     = get_u32_inc(&payload);
+
+	if (address >= W25Q128_SIZE || address + size > W25Q128_SIZE)
 	{
-		log_e("verify address=0x%08X, size=%u out of range", address, size);
+		log_e("verify address=0x%08X, size=%u out of W25Q128 range", address, size);
 		bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_PARAM, NULL, 0);
 		return;
 	}
-	log_d("verify address=0x%08X, size=%u, crc=0x%08X", address, size, crc);
-	uint32_t ccrc = crc32((uint8_t *)address, size);
+
+	log_i("verify B: 0x%08X, %u bytes, expected CRC=0x%08X", address, size, crc);
+
+	/* 分块读取 B区 并增量计算 CRC32 (避免大固件撑爆 RAM) */
+#define CRC_CHUNK_SIZE 1024
+	uint8_t chunk[CRC_CHUNK_SIZE];
+	uint32_t ccrc    = 0;
+	uint32_t offset  = 0;
+	uint32_t elapsed = 0;
+
+	while (offset < size)
+	{
+		uint32_t chunk_len = CRC_CHUNK_SIZE;
+		if (chunk_len > size - offset) chunk_len = size - offset;
+
+		bl_w25q128_read(address + offset, chunk, chunk_len);
+		ccrc = crc32_continue(ccrc, chunk, chunk_len);
+		offset += chunk_len;
+
+		/* 进度日志 (每 64KB 打印一次) */
+		elapsed += chunk_len;
+		if (elapsed >= 65536 || offset >= size)
+		{
+			log_d("verify progress: %u / %u bytes", offset, size);
+			elapsed = 0;
+		}
+	}
+
 	if (ccrc != crc)
 	{
-		log_e("verify failed: expected 0x%08X, got 0x%08X", crc, ccrc);
+		log_e("verify FAIL: calc=0x%08X, expected=0x%08X", ccrc, crc);
 		bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_VERIFY, NULL, 0);
 		return;
 	}
+
+	log_i("verify B OK: CRC=0x%08X", ccrc);
 	bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_OK, NULL, 0);
 }
 
@@ -298,9 +339,44 @@ static void bl_opcode_reset_handler(void)
 
 static void bl_opcode_boot_handler(void)
 {
-	log_i("Boot handler");
+	log_i("boot handler reboot to trigger OTA decision");
 	bl_response(PACKET_OPCODE_BOOT, PACKET_ERRCODE_OK, NULL, 0);
-	boot_application();
+	tim_delay_ms(100);
+	NVIC_SystemReset();
+}
+
+/* SET_FLAG: 上位机通知 BootLoader 写入 OTA 标志位
+ * Payload: boot_flag(4B) + firmware_len(4B) + firmware_crc(4B) + version(16B) = 28 bytes
+ */
+static void bl_opcode_set_flag_handler(void)
+{
+	log_i("SET_FLAG handler");
+	uint32_t payload_len = sizeof(uint32_t) * 3 + 16;
+	if (packet_payload_length != payload_len)
+	{
+		log_e("SET_FLAG length error: %u != %u", packet_payload_length, payload_len);
+		bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_PARAM, NULL, 0);
+		return;
+	}
+
+	uint8_t *p = packet_buffer + PACKET_PAYLOAD_OFFSET;
+	boot_info_t info;
+	info.boot_flag    = get_u32_inc(&p);
+	info.firmware_len = get_u32_inc(&p);
+	info.firmware_crc = get_u32_inc(&p);
+	memcpy(info.version, p, 16);
+	info.version[15] = '0';
+
+	log_i("SET_FLAG: flag=0x%02X, len=%u, crc=0x%08X, ver=%s",
+	      info.boot_flag, info.firmware_len, info.firmware_crc, info.version);
+
+	if (!boot_info_write(&info))
+	{
+		log_e("SET_FLAG: boot_info write failed");
+		bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_, NULL, 0);
+		return;
+	}
+	bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_OK, NULL, 0);
 }
 
 static void bl_packet_handler(void)
@@ -319,6 +395,9 @@ static void bl_packet_handler(void)
 	case PACKET_OPCODE_VERIFY:
 		bl_opcode_verify_handler();
 		break;
+	case PACKET_OPCODE_SET_FLAG:
+		bl_opcode_set_flag_handler();
+		break;
 	case PACKET_OPCODE_RESET:
 		bl_opcode_reset_handler();
 		break;
@@ -326,7 +405,6 @@ static void bl_packet_handler(void)
 		bl_opcode_boot_handler();
 		break;
 	default:
-		// // 未知指令
 		log_w("Unknown command: %02X", packet_opcode);
 		break;
 	}
@@ -373,7 +451,8 @@ static bool bl_byte_handler(uint8_t data)
 			packet_buffer[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_PROGRAM ||
 			packet_buffer[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_VERIFY ||
 			packet_buffer[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_RESET ||
-			packet_buffer[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_BOOT)
+			packet_buffer[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_BOOT ||
+			packet_buffer[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_SET_FLAG)
 		{
 			packet_opcode = (packet_opcode_t)packet_buffer[PACKET_OPCODE_OFFSET];
 			packet_state = PACKET_STATE_LENGTH;
@@ -573,51 +652,96 @@ static void boot_perform_upgrade(boot_info_t *info)
 {
 	log_i("=== Firmware upgrade started ===");
 	log_i("  version: %s, size: %u, CRC: 0x%08X",
-		  info->version, info->firmware_len, info->firmware_crc);
-	/* ── 第 1 步：改账本为 TESTING（加锁） ── */
-	log_i("Step 1: set boot_flag = TESTING (lock)");
+	      info->version, info->firmware_len, info->firmware_crc);
+
+	/* 关闭 UART3 接收中断，防止升级期间 ringbuffer 积压 */
+	USART_ITConfig(USART3, USART_IT_RXNE, DISABLE);
+
+#define BUF_SIZE 4096
+	uint8_t *buf = (uint8_t *)packet_buffer; /* 复用 4KB 协议缓冲区 */
+
+	/* ── 第 1 步：加锁 ── */
+	log_i("Step 1/5: set boot_flag = TESTING (lock)");
 	info->boot_flag = BOOT_FLAG_TESTING;
 	if (!boot_info_write(info))
 	{
 		log_e("Failed to set TESTING flag, abort");
 		return;
 	}
-	/* ── 第 2 步：擦除主区 (A区 = 内部 Flash APP 区域) ── */
-	log_i("Step 2: erase A area (0x%08X ~ 0x%08X)",
-		  APP_VOTR_ADDR, APP_VOTR_ADDR + info->firmware_len);
-	/*
-	 * TODO: 调用 stm32_flash_unlock() + stm32_flash_erase() 擦除主区。
-	 *       擦除范围需对齐扇区边界 (stm32_flash_erase 内部实现)。
-	 */
-	/* ── 第 3 步：搬运固件 (B区 → A区) ── */
-	log_i("Step 3: copy firmware B area -> A area");
-	/*
-	 * TODO: 从外挂 Flash (B区) 逐页读取，写入内部 Flash (A区)。
-	 *       使用 bl_eeprom_read() 或外挂 Flash 驱动读取，
-	 *       使用 stm32_flash_program() 写入。
-	 */
-	/* ── 第 4 步：CRC32 全量校验 ── */
-	log_i("Step 4: CRC32 full verification");
-	/*
-	 * TODO: uint32_t calc_crc = crc32((uint8_t*)APP_VOTR_ADDR, info->firmware_len);
-	 *       if (calc_crc != info->firmware_crc) { log_e("CRC fail"); return; }
-	 */
-	/* ── 第 5 步：改账本闭环 — 写回 NORMAL（解锁） ── */
-	log_i("Step 5: upgrade done, set boot_flag = NORMAL (unlock)");
-	info->boot_flag = BOOT_FLAG_NORMAL;
+
+	/* ── 第 2 步：擦除整个 A区 (内部 Flash) ──
+	 *  擦全量而非仅 firmware_len：
+	 *  防止旧固件比新固件大时，尾部残留旧代码。
+	 *  stm32_flash_erase 内部按扇区对齐，不会多擦。 */
+	{
+		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE; /* A区总容量 */
+		log_i("Step 2/5: erase full A area (0x%08X, %u bytes)",
+		      APP_VOTR_ADDR, a_size);
+		stm32_flash_unlock();
+		stm32_flash_erase(APP_VOTR_ADDR, a_size);
+		stm32_flash_lock();
+	}
+
+	/* ── 第 3 步：搬运 B区(W25Q128) → A区(内部Flash) ── */
+	log_i("Step 3/5: copy B area -> A area (%u bytes)", info->firmware_len);
+	uint32_t offset = 0;
+	while (offset < info->firmware_len)
+	{
+		uint32_t chunk = BUF_SIZE;
+		if (chunk > info->firmware_len - offset)
+			chunk = info->firmware_len - offset;
+
+		bl_w25q128_read(offset, buf, chunk);
+		stm32_flash_unlock();
+		stm32_flash_program(APP_VOTR_ADDR + offset, buf, chunk);
+		stm32_flash_lock();
+
+		offset += chunk;
+		if ((offset & 0xFFFF) == 0 || offset >= info->firmware_len)
+			log_d("copy progress: %u / %u bytes", offset, info->firmware_len);
+	}
+
+	/* ── 第 4 步：CRC32 全量校验 A区 ── */
+	log_i("Step 4/5: CRC32 verify A area");
+	uint32_t ccrc = 0;
+	offset = 0;
+	while (offset < info->firmware_len)
+	{
+		uint32_t chunk = BUF_SIZE;
+		if (chunk > info->firmware_len - offset)
+			chunk = info->firmware_len - offset;
+
+		/* A区在内部 Flash, 可直接通过地址读取 */
+		ccrc = crc32_continue(ccrc, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
+		offset += chunk;
+	}
+
+	if (ccrc != info->firmware_crc)
+	{
+		log_e("CRC FAIL: calc=0x%08X, expected=0x%08X", ccrc, info->firmware_crc);
+		/* boot_flag 保持 TESTING, 下次启动重试 */
+		return;
+	}
+	log_i("CRC32 verify OK: 0x%08X", ccrc);
+
+	/* ── 第 5 步：改账本闭环 ── */
+	log_i("Step 5/5: upgrade done, set boot_flag = NORMAL (unlock)");
+	info->boot_flag    = BOOT_FLAG_NORMAL;
 	info->firmware_len = 0;
 	info->firmware_crc = 0;
+	memset(info->version, 0, sizeof(info->version));
 	if (!boot_info_write(info))
 	{
 		log_e("Failed to write final boot_info");
 		return;
 	}
-	/* ── 第 6 步：复位 → 下个启动周期走 NORMAL 模式跳新 APP ── */
+
 	log_i("=== Upgrade complete, rebooting... ===");
+	tim_delay_ms(100);
+	NVIC_SystemReset();
 }
 
 /* ──────────────────────────────────────────────
-
  * Bootloader 主入口
  *
  *  启动判决三步法:

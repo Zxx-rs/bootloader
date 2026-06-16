@@ -1,0 +1,293 @@
+上位机 OTA 工具改造指南：单区 → A/B 分区
+============================================================
+
+适用项目：STM32F4 OTA BootLoader 上位机 (.NET 8.0 WinForms)
+改造目标：适配新增 W25Q128 B区 + EEPROM OTA 标志位 + 搬运逻辑
+
+
+================================================================================
+一、改造总览
+================================================================================
+
+  ┌──────────────┬──────────────────────────┬─────────────────────────┐
+  │ 改动项        │ 旧值 / 旧逻辑            │ 新值 / 新逻辑            │
+  ├──────────────┼──────────────────────────┼─────────────────────────┤
+  │ ERASE 地址    │ header.DataAddress       │ 固定 = 0x00000000       │
+  │ PROGRAM 地址  │ header.DataAddress       │ 固定 = 0x00000000       │
+  │ VERIFY 地址   │ header.DataAddress       │ 固定 = 0x00000000       │
+  │ Magic Header  │ 擦 + 写 + 验 (独立步骤)  │ 删除此步骤              │
+  │ SET_FLAG (新) │ 无                       │ opcode=0x84, 28B payload │
+  │ BOOT 后       │ 直接认为完成              │ 等待 5 秒 (B→A 搬运)    │
+  └──────────────┴──────────────────────────┴─────────────────────────┘
+
+  关键理解：旧工具直接把固件写入内部 Flash 并跳转执行。
+           新工具把固件写入外挂 W25Q128 (B区)，然后通过 SET_FLAG
+           通知 BootLoader，再由 BootLoader 复位后搬运到内部 Flash (A区)。
+
+
+================================================================================
+二、文件改动清单
+================================================================================
+
+  需要修改的文件：
+    - Form1.cs       主流程编排（改动最大）
+    - Transfer.cs    新增 SET_FLAG 命令 (opcode 0x84)
+
+  无需修改的文件：
+    - CRC.cs         无需修改
+    - MagicHeader.cs 无需修改（仍用于解析 .xbin）
+    - Program.cs     无需修改
+
+
+================================================================================
+三、Transfer.cs 改动明细
+================================================================================
+
+----------------------------------------------------------------------
+  3.1 新增 SET_FLAG 操作码常量
+----------------------------------------------------------------------
+
+  在 OPCODE 枚举中添加一项。找到 Transfer.cs 中已有的枚举定义，
+  在现有最后一项后面添加：
+
+    SET_FLAG = 0x84,  // 写入 OTA 标志位到 EEPROM
+
+----------------------------------------------------------------------
+  3.2 新增 SetFlag() 公共方法
+----------------------------------------------------------------------
+
+  在 Transfer.cs 中其他公共方法（如 Boot()）旁边添加。
+  超时建议 10 秒（涉及 EEPROM 双区写入）。
+
+  方法签名和逻辑（C# 代码）：
+
+    public bool SetFlag(uint firmwareLen, uint firmwareCrc, string version)
+    {
+        // 1. 构造 28 字节 payload
+        byte[] param = new byte[28];
+
+        // boot_flag = 0x01 (NEW_FW), uint32 LE, offset 0
+        BitConverter.GetBytes((uint)1).CopyTo(param, 0);
+
+        // firmware_len, uint32 LE, offset 4
+        BitConverter.GetBytes(firmwareLen).CopyTo(param, 4);
+
+        // firmware_crc, uint32 LE, offset 8
+        BitConverter.GetBytes(firmwareCrc).CopyTo(param, 8);
+
+        // version 字符串, 16 bytes ASCII, offset 12
+        // 截断到 15 字符 + '\0', 不足补 '\0'
+        byte[] verBytes = new byte[16];
+        byte[] srcBytes = Encoding.ASCII.GetBytes(version ?? "0.0.0");
+        int copyLen = Math.Min(srcBytes.Length, 15);
+        Array.Copy(srcBytes, 0, verBytes, 0, copyLen);
+        Array.Copy(verBytes, 0, param, 12, 16);
+
+        // 2. 组帧并发送
+        byte[] packet = BuildPacket(OPCODE.SET_FLAG, param);
+        if (!PacketRequest(packet, out byte[]? response, timeout_ms: 10000))
+            return false;
+
+        // 3. 校验响应 (response[2] == 0x00 表示成功)
+        return response != null && response.Length >= 3 && response[2] == 0x00;
+    }
+
+  说明：
+  - BitConverter.GetBytes 在 Windows 上返回小端字节序，与 ARM Cortex-M4 一致
+  - Encoding.ASCII.GetBytes 将 C# 字符串转为 ASCII 字节数组
+  - BuildPacket 内部自动调用 CRC.CRC16 计算校验和
+
+
+================================================================================
+四、Form1.cs 改动明细
+================================================================================
+
+----------------------------------------------------------------------
+  4.1 新增 B区地址常量
+----------------------------------------------------------------------
+
+  在 Form1 类中添加：
+
+    private const uint B_AREA_ADDR = 0x00000000;  // W25Q128 B区起始地址
+
+----------------------------------------------------------------------
+  4.2 删除 Magic Header 写入步骤
+----------------------------------------------------------------------
+
+  找到 buttonUpgrade_Click 方法中 "写入 Magic Header" 的代码块，
+  完整删除以下逻辑：
+
+    // 旧代码：先擦除 header 地址 -> 写入 header -> 校验 header
+    // 包括 Erase(headerAddr, ...) + Program(headerAddr, ...) + Verify(headerAddr, ...)
+    // 全部删除
+
+  原因：新方案中 Magic Header 不作为独立步骤通过串口写入。
+        BootLoader 自行管理 Magic Header。
+
+----------------------------------------------------------------------
+  4.3 修改固件数据写入步骤
+----------------------------------------------------------------------
+
+  将原来写内部 Flash 地址的逻辑改为写 B区固定地址。
+
+  需要改的地方：找到 Erase / Program / Verify 调用，将第一个参数
+  从 header.DataAddress 改为 B_AREA_ADDR。
+
+  旧代码模式：
+    uint targetAddr = header.DataAddress;  // 例如 0x08010000
+    transfer.Erase(targetAddr, databin.Length);
+    transfer.Program(targetAddr, databin, mtu);
+    transfer.Verify(targetAddr, databin.Length, datacrc);
+
+  改为：
+    transfer.Erase(B_AREA_ADDR, databin.Length);
+    transfer.Program(B_AREA_ADDR, databin, mtu);
+    transfer.Verify(B_AREA_ADDR, databin.Length, datacrc);
+
+----------------------------------------------------------------------
+  4.4 新增 SET_FLAG 步骤
+----------------------------------------------------------------------
+
+  在 VERIFY 成功后、BOOT 发送前，插入以下代码：
+
+    // ---- 写入 OTA 标志位 ----
+    string fwVersion = header.Version ?? "0.0.0";
+    LogEvent($"写入 OTA 标志位: ver={fwVersion}, len={databin.Length}, crc=0x{datacrc:X8}");
+    if (!transfer.SetFlag((uint)databin.Length, datacrc, fwVersion))
+    {
+        LogEvent("SET_FLAG 写入失败，升级中止");
+        return;
+    }
+    LogEvent("OTA 标志位写入成功 (B->A 双区 EEPROM)");
+
+  说明：
+  - header.Version 从 .xbin 的 Magic Header 中读取
+  - 如果为空，默认传 "0.0.0"
+
+----------------------------------------------------------------------
+  4.5 修改 BOOT 步骤，增加等待时间
+----------------------------------------------------------------------
+
+  BOOT 命令保持不变，但在之后增加等待逻辑。
+
+  旧代码：
+    transfer.Boot();
+
+  改为：
+    // 触发 MCU 复位，BootLoader 将搬运 B->A
+    if (!transfer.Boot())
+    {
+        LogEvent("BOOT 命令发送失败");
+        return;
+    }
+    LogEvent("固件已写入 B区，MCU 正在搬运 B->A...");
+
+    // 等待搬运完成: 固件大小 / Flash 写入速度 (~100KB/s) + 余量
+    int waitSec = Math.Max(5, (int)(databin.Length / 65536) + 3);
+    LogEvent($"等待 {waitSec} 秒...");
+    await Task.Delay(waitSec * 1000);
+
+    LogEvent("升级完成！");
+
+----------------------------------------------------------------------
+  4.6 修改日志提示文字
+----------------------------------------------------------------------
+
+  将日志中所有 "Flash" 字样的提示改为 "B区 Flash (W25Q128)"，
+  让用户清楚数据写入到了哪里。例如：
+
+    "擦除 Flash..."     -> "擦除 B区 Flash (W25Q128)..."
+    "写入 Flash..."     -> "写入 B区 Flash (W25Q128)..."
+    "校验 Flash CRC..." -> "校验 B区 CRC32..."
+
+
+================================================================================
+五、MagicHeader.cs 注意事项
+================================================================================
+
+  MagicHeader.cs 无需修改。但注意 DataAddress 字段不再用于
+  决定写入位置。上位机始终将固件写入 B区 (0x00000000)。
+
+  如果需要保留日志中的地址信息：
+    LogEvent($"固件目标 A区地址: 0x{header.DataAddress:X8} " +
+             $"(固件将先写入 B区，搬运后至此地址运行)");
+
+
+================================================================================
+六、完整升级流程对照
+================================================================================
+
+  旧流程：
+  ┌─────────┐
+  │ INQUERY │
+  ├─────────┤
+  │ Erase     header 地址     <-- 删除
+  │ Program   header 数据     <-- 删除
+  │ Verify    header CRC      <-- 删除
+  ├─────────┤
+  │ Erase     A区 (0x08010000)
+  │ Program   A区
+  │ Verify    A区 CRC32
+  ├─────────┤
+  │ BOOT -> 直接跳转
+  └─────────┘
+
+  新流程：
+  ┌─────────┐
+  │ INQUERY │
+  ├─────────┤
+  │ Erase     B区 (0x00000000)       <-- 固定地址
+  │ Program   B区 (分片写入)
+  │ Verify    B区 CRC32
+  ├─────────┤
+  │ SET_FLAG  写 EEPROM (新增)        <-- flag=0x01, len, crc, ver
+  ├─────────┤
+  │ BOOT      MCU 复位                <-- 搬运 B->A
+  │           等待 5+ 秒               <-- 新增等待
+  └─────────┘
+
+
+================================================================================
+七、协议帧速查
+================================================================================
+
+  SET_FLAG 完整帧 (共 36 字节)：
+
+  ┌────────┬────────┬──────────┬──────────────────────────────────────────┬─────────┐
+  │ Header │ Opcode │ Length   │              Payload (28B)               │ CRC16   │
+  │  0xAA  │  0x84  │ 0x1C 0x00│ boot_flag firmware_len firmware_crc ver │  2B LE  │
+  │  1B    │  1B    │  2B LE   │  4B LE     4B LE        4B LE       16B │         │
+  └────────┴────────┴──────────┴──────────────────────────────────────────┴─────────┘
+
+  boot_flag 取值:
+    0x00 = NORMAL  (正常运行)
+    0x01 = NEW_FW  (有新固件待搬运)  <-- SetFlag 写这个值
+    0x02 = TESTING (升级中, 防掉电)
+
+
+================================================================================
+八、测试验证步骤
+================================================================================
+
+  1. 编译上位机工具
+  2. 准备一个测试 .xbin 固件文件
+  3. 连接 STM32F4 开发板，确认串口正常
+  4. 运行上位机，选择固件和串口，点击升级
+  5. 观察 STM32 串口日志（通过 USART1 调试口输出）：
+
+     第一次启动 (模拟固件写入 B区后):
+       [boot] Bootloader start
+       [boot_info] boot_info read from A OK, boot_flag=0x01   <-- NEW_FW
+       [boot] Flag: NEW_FW -- firmware update required
+       [boot] Step 1/5: set boot_flag = TESTING (lock)
+       [boot] Step 2/5: erase full A area
+       [boot] Step 3/5: copy B area -> A area
+       [boot] Step 4/5: CRC32 verify A area
+       [boot] CRC32 verify OK: 0xXXXXXXXX
+       [boot] Step 5/5: upgrade done, set boot_flag = NORMAL
+       [boot] === Upgrade complete, rebooting... ===
+
+     第二次启动 (搬运完成, 正常运行):
+       [boot] Bootloader start
+       [boot] Flag: NORMAL -- no firmware update, booting app
+       [boot] Jump to application.....

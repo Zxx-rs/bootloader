@@ -81,3 +81,23 @@ uint32_t crc32(const unsigned char *s, size_t len)
 
     return crc32val ^ 0xFFFFFFFF;
 }
+
+/* 增量 CRC32: 从 prev_crc 的中间状态继续计算
+ *   prev_crc = 0        → 等价于 crc32(s, len)
+ *   prev_crc = crc32(a) → crc32_continue(prev_crc, b, len_b) = crc32(a+b)
+ */
+uint32_t crc32_continue(uint32_t prev_crc, const unsigned char *s, size_t len)
+{
+    int i;
+    uint32_t crc32val;
+
+    if (prev_crc == 0)
+        crc32val = 0xFFFFFFFF;
+    else
+        crc32val = prev_crc ^ 0xFFFFFFFF;
+
+    for (i = 0; i < len; i++)
+        crc32val = crc32_tab[(crc32val ^ s[i]) & 0xFF] ^ ((crc32val >> 8) & 0x00FFFFFF);
+
+    return crc32val ^ 0xFFFFFFFF;
+}

@@ -343,7 +343,6 @@ bool bl_w25q128_self_test(void)
         log_e("self-test: data mismatch");
         return false;
     }
-
     log_i("W25Q128 self-test PASSED");
     return true;
 }

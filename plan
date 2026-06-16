@@ -1,0 +1,14 @@
+A. 上位机 OTA 工具（紧迫性：高）
+PC 端 Python 脚本，读取 .bin 固件 → 自动分包 → 串口发送 ERASE/PROGRAM/VERIFY/SET_FLAG/BOOT → 处理响应。没有它整个 OTA 链路无法验证。
+
+B. Magic Header 写入
+固件 .bin 文件需要嵌入 magic_header_t，BootLoader 才能校验 APP。可以集成到上位机工具中（发送前自动在 .bin 末尾追加 header），或者做成独立工具。
+
+C. APP 端确认机制
+升级完成后 boot_flag 直接从 NEW_FW 跳到 NORMAL，跳过了 TESTING 阶段。完整的流程应该是 APP 启动后主动上报"运行正常"，BootLoader 收到后才把 flag 改为 NORMAL。如果 APP 起不来，下次上电 flag 仍是 TESTING → 触发回退。
+
+D. 版本回退逻辑
+B区保留上一个版本的固件，当新版本 APP 确认失败时，自动从 B区恢复旧版本。
+
+E. 当前固件备份到 B区
+首次升级前，先把 A区现有的 APP 备份到 B区的高地址区域。这样即使升级失败也可以回退到出厂固件。

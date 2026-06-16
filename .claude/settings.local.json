@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python)"
+      "Bash(python)",
+      "Bash(mkdir -p d:/STM32F4/OTA/BootLoader/plan)",
+      "Bash(python -c ' *)"
+    ],
+    "additionalDirectories": [
+      "d:\\STM32F4\\OTA\\BootLoader"
     ]
   }
 }
