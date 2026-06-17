@@ -21,19 +21,22 @@ void board_lowlevel_init(void)
 }
 
 
-static struct led_desc _led0 = { GPIOE, GPIO_Pin_5, Bit_RESET, Bit_SET};
-static struct led_desc _led1 = { GPIOE, GPIO_Pin_6, Bit_RESET, Bit_SET};
-static struct led_desc _led2 = { GPIOC, GPIO_Pin_13, Bit_RESET, Bit_SET};
-led_desc_t led0 = &_led0;
+static struct led_desc _led1 = { GPIOB, GPIO_Pin_0, Bit_RESET, Bit_SET};
+static struct led_desc _led2 = { GPIOB, GPIO_Pin_1, Bit_RESET, Bit_SET};
+static struct led_desc _led3 = { GPIOE, GPIO_Pin_9, Bit_RESET, Bit_SET};
 led_desc_t led1 = &_led1;
 led_desc_t led2 = &_led2;
+led_desc_t led3 = &_led3;
 
 
-static struct key_desc _key3 = { GPIOE, GPIO_Pin_1, GPIO_PuPd_UP, Bit_RESET};
-static struct key_desc _key4 = { GPIOE, GPIO_Pin_0, GPIO_PuPd_UP, Bit_RESET};
+static struct key_desc _key1 = { GPIOA, GPIO_Pin_0, GPIO_PuPd_UP, Bit_RESET};
+static struct key_desc _key2 = { GPIOC, GPIO_Pin_4, GPIO_PuPd_UP, Bit_RESET};
+static struct key_desc _key3 = { GPIOC, GPIO_Pin_5, GPIO_PuPd_UP, Bit_RESET};
 
+key_desc_t key1 = &_key1;
+key_desc_t key2 = &_key2;
 key_desc_t key3 = &_key3;
-key_desc_t key4 = &_key4;
+
 
 int fputc(int ch, FILE *f)
 {

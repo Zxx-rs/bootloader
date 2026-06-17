@@ -1,8 +1,10 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "crc32.h"
 #include "utils.h"
 #include "magic_header.h"
+#include "stm32_flash.h"
 
 #define MAGIC_HEADER_MAGIC 0x4D414749 // "MAGI"
 
@@ -69,4 +71,36 @@ uint32_t magic_header_get_crc32(void)
 {
     magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDR;
     return header->data_crc32;
+}
+
+bool magic_header_write(uint32_t fw_addr, uint32_t fw_len, uint32_t fw_crc, const char *version)
+{
+    magic_header_t header;
+
+    memset(&header, 0, sizeof(header));
+
+    header.magic        = MAGIC_HEADER_MAGIC;
+    header.data_type    = MAGIC_HEADER_TYPE_APP;
+    header.data_offset  = fw_addr - MAGIC_HEADER_ADDR;  /* 头部到固件的 Flash 偏移 */
+    header.data_address = fw_addr;
+    header.data_length  = fw_len;
+    header.data_crc32   = fw_crc;
+    header.this_address = MAGIC_HEADER_ADDR;
+
+    if (version)
+    {
+        strncpy(header.version, version, sizeof(header.version) - 1);
+        header.version[sizeof(header.version) - 1] = '\0';
+    }
+
+    /* 计算头部自身 CRC (前 252 字节, 不含 this_crc32 字段) */
+    header.this_crc32 = crc32((uint8_t *)&header, offset_of(magic_header_t, this_crc32));
+
+    /* 擦除并写入 */
+    stm32_flash_unlock();
+    stm32_flash_erase(MAGIC_HEADER_ADDR, sizeof(header));
+    stm32_flash_program(MAGIC_HEADER_ADDR, (uint8_t *)&header, sizeof(header));
+    stm32_flash_lock();
+
+    return magic_header_validate();
 }

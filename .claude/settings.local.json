@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python)",
       "Bash(mkdir -p d:/STM32F4/OTA/BootLoader/plan)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git checkout *)"
     ],
     "additionalDirectories": [
       "d:\\STM32F4\\OTA\\BootLoader"

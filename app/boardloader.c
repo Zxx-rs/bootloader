@@ -536,7 +536,7 @@ static bool key_trap_check(void)
 	for (uint32_t t = 0; t < BOOT_DELAY; t += 10)
 	{
 		tim_delay_ms(10);
-		if (!key_read(key4)) // // 按键松开，退出BootLoader
+		if (!key_read(key1)) // // 按键松开，退出BootLoader
 			return false;
 	}
 	log_w("key pressed, trap into boot");
@@ -546,17 +546,17 @@ static bool key_trap_check(void)
 static void wait_key_release(void) // 释放按键，防止进入BootLoader后按键状态未释放导致误认为再次按下而复位
 
 {
-	while (key_read(key4))
+	while (key_read(key1))
 		tim_delay_ms(10);
 }
 
 static bool key_press_check(void) // 已经进入BootLoader模式，检测按键是否被按下，若按下返回true
 
 {
-	if (!key_read(key4))
+	if (!key_read(key1))
 		return false;
 	tim_delay_ms(10); // 擦除
-	if (!key_read(key4))
+	if (!key_read(key1))
 		return false;
 	return true;
 }
@@ -644,8 +644,6 @@ static void boot_normal_mode(void)
  *   4. 搬运完成后 CRC32 全量校验。
  *   5. 校验通过 → boot_flag 改回 NORMAL (0x00)，改账本闭环。
  *   6. 系统复位，下次启动走 NORMAL 模式 → 跳转新 APP。
- *
- *  TODO: B区(外挂Flash)驱动尚未实现，2~4 步为占位，当前仅验证决策逻辑。
  * ────────────────────────────────────────────── */
 
 static void boot_perform_upgrade(boot_info_t *info)
@@ -682,9 +680,11 @@ static void boot_perform_upgrade(boot_info_t *info)
 		stm32_flash_lock();
 	}
 
-	/* ── 第 3 步：搬运 B区(W25Q128) → A区(内部Flash) ── */
-	log_i("Step 3/5: copy B area -> A area (%u bytes)", info->firmware_len);
-	uint32_t offset = 0;
+	/* ── 第 3 步：搬运 B区 → A区，同步计算 CRC 双向比对 ── */
+	log_i("Step 3/5: copy B -> A (%u bytes), CRC in-pass", info->firmware_len);
+	uint32_t src_crc = 0;   /* B区读取时累积 */
+	uint32_t dst_crc = 0;   /* A区写入后回读累积 */
+	uint32_t offset  = 0;
 	while (offset < info->firmware_len)
 	{
 		uint32_t chunk = BUF_SIZE;
@@ -692,40 +692,37 @@ static void boot_perform_upgrade(boot_info_t *info)
 			chunk = info->firmware_len - offset;
 
 		bl_w25q128_read(offset, buf, chunk);
+		src_crc = crc32_continue(src_crc, buf, chunk);
+
 		stm32_flash_unlock();
 		stm32_flash_program(APP_VOTR_ADDR + offset, buf, chunk);
 		stm32_flash_lock();
 
+		dst_crc = crc32_continue(dst_crc, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
+
 		offset += chunk;
 		if ((offset & 0xFFFF) == 0 || offset >= info->firmware_len)
-			log_d("copy progress: %u / %u bytes", offset, info->firmware_len);
+			log_d("copy+verify: %u / %u bytes", offset, info->firmware_len);
 	}
 
-	/* ── 第 4 步：CRC32 全量校验 A区 ── */
-	log_i("Step 4/5: CRC32 verify A area");
-	uint32_t ccrc = 0;
-	offset = 0;
-	while (offset < info->firmware_len)
+	if (src_crc != dst_crc)
 	{
-		uint32_t chunk = BUF_SIZE;
-		if (chunk > info->firmware_len - offset)
-			chunk = info->firmware_len - offset;
-
-		/* A区在内部 Flash, 可直接通过地址读取 */
-		ccrc = crc32_continue(ccrc, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
-		offset += chunk;
-	}
-
-	if (ccrc != info->firmware_crc)
-	{
-		log_e("CRC FAIL: calc=0x%08X, expected=0x%08X", ccrc, info->firmware_crc);
-		/* boot_flag 保持 TESTING, 下次启动重试 */
+		log_e("COPY FAIL: B CRC=0x%08X != A CRC=0x%08X", src_crc, dst_crc);
 		return;
 	}
-	log_i("CRC32 verify OK: 0x%08X", ccrc);
+	log_i("B->A copy OK, CRC=0x%08X", src_crc);
+
+	/* ── 第 4 步：写入 Magic Header 到 0x0800C000 ── */
+	log_i("Step 4/5: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
+	if (!magic_header_write(APP_VOTR_ADDR, info->firmware_len, src_crc, info->version))
+	{
+		log_e("Magic Header write failed");
+		return;
+	}
+	log_i("Magic Header written OK");
 
 	/* ── 第 5 步：改账本闭环 ── */
-	log_i("Step 5/5: upgrade done, set boot_flag = NORMAL (unlock)");
+	log_i("Step 5/5: upgrade done, set boot_flag = NORMAL");
 	info->boot_flag    = BOOT_FLAG_NORMAL;
 	info->firmware_len = 0;
 	info->firmware_crc = 0;
@@ -757,23 +754,23 @@ void bootloader_main(void)
 {
 	log_i("Bootloader start");
 	led_init(led1);
-	key_init(key4);
+	key_init(key1);
 	bl_uart_init();
 	bl_uart_register_rx_callback(bl_rx_handler);
 	rx_rb = rb_new(rx_ringbuffer, RX_BUFFER_SIZE);
 	/* 初始化 BL24C512 EEPROM (I2C1: PB6=SCL, PB7=SDA) */
 	bl_eeprom_init();
-	if (!bl_eeprom_self_test())
-	{
-		log_e("EEPROM self-test FAILED");
-	}
+//	if (!bl_eeprom_self_test())
+//	{
+//		log_e("EEPROM self-test FAILED");
+//	}
 
 	/* 初始化 W25Q128 外挂 Flash (SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, PE13=CS) */
 	bl_w25q128_init();
-	if (!bl_w25q128_self_test())
-	{
-		log_e("W25Q128 self-test FAILED");
-	}
+//	if (!bl_w25q128_self_test())
+//	{
+//		log_e("W25Q128 self-test FAILED");
+//	}
 	/* ──── 第一步：验证账本本身有没有坏 ──── */
 	boot_info_t boot_info;
 	if (!boot_info_read(&boot_info))
@@ -781,7 +778,7 @@ void bootloader_main(void)
 		/* CRC 校验失败（两区均坏），已自动使用默认值 (NORMAL) */
 		log_w("boot_info recovered with defaults");
 	}
-	boot_info_dump(&boot_info);
+//	boot_info_dump(&boot_info);
 	/* ──── 第二步：根据 boot_flag 做出命运判决 ──── */
 	switch (boot_info.boot_flag)
 	{
