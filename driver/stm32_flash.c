@@ -15,7 +15,7 @@ typedef struct
     uint32_t size;
 } sector_desc_t;
 
-// 扇区映射
+// 鎵囧尯鏄犲皠
 static const sector_desc_t sector_descs[] =
     {
         {FLASH_Sector_0, 16 * 1024},   // Sector 0: 16 KB
@@ -34,12 +34,12 @@ static const sector_desc_t sector_descs[] =
 
 void stm32_flash_lock(void)
 {
-    FLASH_Lock(); // 上锁
+    FLASH_Lock(); // 涓婇攣
 }
 
 void stm32_flash_unlock(void)
 {
-    FLASH_Unlock(); // 解锁
+    FLASH_Unlock(); // 瑙ｉ攣
 }
 
 void stm32_flash_erase(uint32_t address, uint32_t size)
@@ -47,8 +47,8 @@ void stm32_flash_erase(uint32_t address, uint32_t size)
     uint32_t addr = FLASH_BASE_ADDRESS;
     for (uint32_t i = 0; i < ARRAY_SIZE(sector_descs); i++)
     {
-        // 只要当前这个物理扇区的首地址（addr），落在[address, address + size) 之内，这个扇区就得被擦除
-        if (addr >= address && addr < address + size) // 只要
+        // 鍙褰撳墠杩欎釜鐗╃悊鎵囧尯鐨勯鍦板潃锛坅ddr锛夛紝钀藉湪[address, address + size) 涔嬪唴锛岃繖涓墖鍖哄氨寰楄鎿﹂櫎
+        if (addr >= address && addr < address + size) // 鍙
         {
             log_i("erasing sector %u at address 0x%08X size %u", i, addr, sector_descs[i].size);
             if (FLASH_EraseSector(sector_descs[i].sector, VoltageRange_3) != FLASH_COMPLETE)

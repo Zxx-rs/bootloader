@@ -163,15 +163,15 @@ bool boot_info_write(const boot_info_t *info)
     /* 步骤 1：先写 B 区（备份锚点） */
     if (!boot_info_write_to(BOOT_INFO_B_ADDR, &wr))
     {
-        log_e("B area write failed, A area untouched");
+        log_e("B info write failed, A info untouched");
         return false;
     }
-    log_i("B area written OK (anchor)");
+    log_i("B info written OK");
 
     /* 步骤 2：B 区成功后，再写 A 区（主区） */
     if (!boot_info_write_to(BOOT_INFO_A_ADDR, &wr))
     {
-        log_e("A area write failed, but B area is intact (will self-heal on next boot)");
+        log_e("A area write failed, but B info is intact (will self-heal on next boot)");
         return false;
     }
 

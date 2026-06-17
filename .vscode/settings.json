@@ -3,7 +3,7 @@
         "*.h": "c"
     },
     "files.autoGuessEncoding": false,
-    "files.encoding": "gb2312",
+    "files.encoding": "utf8",
     "files.exclude": {
         "**/.git": true,
         "**/.svn": true,

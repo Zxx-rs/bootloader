@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define MAGIC_HEADER_ADDR  0x0800C000  /* Magic Header µÿ÷∑ */
+
 typedef enum
 {
     MAGIC_HEADER_TYPE_APP = 1,

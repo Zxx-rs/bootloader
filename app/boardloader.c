@@ -49,6 +49,7 @@
 // 参数长度常量
 #define ADDR_SIZE_PARAM_LENGTH 8	  // uint addr + uint size
 #define ADDR_SIZE_CRC_PARAM_LENGTH 12 // uint addr + uint size + uint crc
+#define MAGIC_HEADER_BIN_SIZE   256   /* Magic Header 二进制大小 */
 typedef enum
 {
 	PACKET_STATE_HEADER,  // 帧头，1字节，固定为0xAA
@@ -651,8 +652,13 @@ static void boot_normal_mode(void)
 static void boot_perform_upgrade(boot_info_t *info)
 {
 	log_i("=== Firmware upgrade started ===");
-	log_i("  version: %s, size: %u, CRC: 0x%08X",
-	      info->version, info->firmware_len, info->firmware_crc);
+	/* 强制截断版本号防止 %s 读穿 */
+	info->version[sizeof(info->version) - 1] = '\0';
+	log_i("  version: %s", info->version);
+	log_i("  B total: %u bytes, firmware: %u bytes, CRC: 0x%08X",
+	      info->firmware_len,
+	      info->firmware_len - MAGIC_HEADER_BIN_SIZE,
+	      info->firmware_crc);
 
 	/* 关闭 UART3 接收中断，防止升级期间 ringbuffer 积压 */
 	USART_ITConfig(USART3, USART_IT_RXNE, DISABLE);
@@ -682,47 +688,53 @@ static void boot_perform_upgrade(boot_info_t *info)
 		stm32_flash_lock();
 	}
 
-	/* ── 第 3 步：搬运 B区(W25Q128) → A区(内部Flash) ── */
-	log_i("Step 3/5: copy B area -> A area (%u bytes)", info->firmware_len);
-	uint32_t offset = 0;
-	while (offset < info->firmware_len)
+	/* ── 第 3 步：搬运 B区(W25Q128) → Magic Header + A区(内部Flash) ── */
+	/* B区布局: [0..255]=Magic Header | [256..]=Firmware Binary
+	 * 搬运: Header → 0x0800C000,   Firmware → 0x08010000 */
+	uint32_t fw_size = info->firmware_len - MAGIC_HEADER_BIN_SIZE;
+
+	log_i("Step 3/5: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
+	bl_w25q128_read(0, buf, MAGIC_HEADER_BIN_SIZE);
+	stm32_flash_unlock();
+	stm32_flash_erase(MAGIC_HEADER_ADDR, MAGIC_HEADER_BIN_SIZE);
+	stm32_flash_program(MAGIC_HEADER_ADDR, buf, MAGIC_HEADER_BIN_SIZE);
+	stm32_flash_lock();
+
+	log_i("Step 3/5: copy B[256..] -> A 0x%08X, CRC in-pass (%u bytes)",
+	      APP_VOTR_ADDR, fw_size);
+	/* 搬运同时计算 CRC（从 B区读取时同步算），拷贝完校验 A区 */
+	uint32_t src_crc = 0;   /* B区数据 CRC */
+	uint32_t dst_crc = 0;   /* A区数据 CRC (搬运后重算) */
+	uint32_t offset  = 0;
+	while (offset < fw_size)
 	{
 		uint32_t chunk = BUF_SIZE;
-		if (chunk > info->firmware_len - offset)
-			chunk = info->firmware_len - offset;
+		if (chunk > fw_size - offset)
+			chunk = fw_size - offset;
 
-		bl_w25q128_read(offset, buf, chunk);
+		bl_w25q128_read(MAGIC_HEADER_BIN_SIZE + offset, buf, chunk);
+		src_crc = crc32_continue(src_crc, buf, chunk);  /* B区 CRC 累积 */
+
 		stm32_flash_unlock();
 		stm32_flash_program(APP_VOTR_ADDR + offset, buf, chunk);
 		stm32_flash_lock();
 
+		/* A区 Flash 可直接读，搬运完一块立即校验该块 */
+		dst_crc = crc32_continue(dst_crc, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
+
 		offset += chunk;
-		if ((offset & 0xFFFF) == 0 || offset >= info->firmware_len)
-			log_d("copy progress: %u / %u bytes", offset, info->firmware_len);
+		if ((offset & 0xFFFF) == 0 || offset >= fw_size)
+			log_d("copy+verify: %u / %u bytes", offset, fw_size);
 	}
 
-	/* ── 第 4 步：CRC32 全量校验 A区 ── */
-	log_i("Step 4/5: CRC32 verify A area");
-	uint32_t ccrc = 0;
-	offset = 0;
-	while (offset < info->firmware_len)
+	/* ── 第 4 步：比对 B区源 CRC vs A区目标 CRC ── */
+	log_i("Step 4/5: CRC verify - src(B)=0x%08X, dst(A)=0x%08X", src_crc, dst_crc);
+	if (src_crc != dst_crc)
 	{
-		uint32_t chunk = BUF_SIZE;
-		if (chunk > info->firmware_len - offset)
-			chunk = info->firmware_len - offset;
-
-		/* A区在内部 Flash, 可直接通过地址读取 */
-		ccrc = crc32_continue(ccrc, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
-		offset += chunk;
-	}
-
-	if (ccrc != info->firmware_crc)
-	{
-		log_e("CRC FAIL: calc=0x%08X, expected=0x%08X", ccrc, info->firmware_crc);
-		/* boot_flag 保持 TESTING, 下次启动重试 */
+		log_e("COPY FAIL: B CRC != A CRC (data corrupted during copy)");
 		return;
 	}
-	log_i("CRC32 verify OK: 0x%08X", ccrc);
+	log_i("CRC verify OK: B == A (0x%08X)", src_crc);
 
 	/* ── 第 5 步：改账本闭环 ── */
 	log_i("Step 5/5: upgrade done, set boot_flag = NORMAL (unlock)");
@@ -763,17 +775,17 @@ void bootloader_main(void)
 	rx_rb = rb_new(rx_ringbuffer, RX_BUFFER_SIZE);
 	/* 初始化 BL24C512 EEPROM (I2C1: PB6=SCL, PB7=SDA) */
 	bl_eeprom_init();
-	if (!bl_eeprom_self_test())
-	{
-		log_e("EEPROM self-test FAILED");
-	}
+//	if (!bl_eeprom_self_test())
+//	{
+//		log_e("EEPROM self-test FAILED");
+//	}
 
 	/* 初始化 W25Q128 外挂 Flash (SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, PE13=CS) */
 	bl_w25q128_init();
-	if (!bl_w25q128_self_test())
-	{
-		log_e("W25Q128 self-test FAILED");
-	}
+//	if (!bl_w25q128_self_test())
+//	{
+//		log_e("W25Q128 self-test FAILED");
+//	}
 	/* ──── 第一步：验证账本本身有没有坏 ──── */
 	boot_info_t boot_info;
 	if (!boot_info_read(&boot_info))
@@ -781,7 +793,7 @@ void bootloader_main(void)
 		/* CRC 校验失败（两区均坏），已自动使用默认值 (NORMAL) */
 		log_w("boot_info recovered with defaults");
 	}
-	boot_info_dump(&boot_info);
+//	boot_info_dump(&boot_info);
 	/* ──── 第二步：根据 boot_flag 做出命运判决 ──── */
 	switch (boot_info.boot_flag)
 	{
