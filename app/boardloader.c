@@ -49,6 +49,7 @@
 // 参数长度常量
 #define ADDR_SIZE_PARAM_LENGTH 8	  // uint addr + uint size
 #define ADDR_SIZE_CRC_PARAM_LENGTH 12 // uint addr + uint size + uint crc
+#define BUF_SIZE      4096   /* 搬运/备份缓冲区大小，复用 packet_buffer */
 typedef enum
 {
 	PACKET_STATE_HEADER,  // 帧头，1字节，固定为0xAA
@@ -655,11 +656,41 @@ static void boot_perform_upgrade(boot_info_t *info)
 	/* 关闭 UART3 接收中断，防止升级期间 ringbuffer 积压 */
 	USART_ITConfig(USART3, USART_IT_RXNE, DISABLE);
 
-#define BUF_SIZE 4096
 	uint8_t *buf = (uint8_t *)packet_buffer; /* 复用 4KB 协议缓冲区 */
 
+	/* ── 第 0 步：备份当前 A区到 W25Q128（回滚锚点） ── */
+	{
+		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE;
+		log_i("Step 0/6: backup A -> W25Q128@0x%08X (%u bytes)", BACKUP_BASE_ADDR, a_size);
+		/* 先擦除备份区 */
+		for (uint32_t addr = BACKUP_BASE_ADDR; addr < BACKUP_BASE_ADDR + a_size; addr += W25Q128_SECTOR_SIZE)
+		{
+			if (!bl_w25q128_erase_sector(addr))
+			{
+				log_e("backup erase failed @ 0x%08X", addr);
+				return;
+			}
+		}
+		/* 分块复制 A区 → W25Q128 */
+		uint32_t offset = 0;
+		while (offset < a_size)
+		{
+			uint32_t chunk = BUF_SIZE;
+			if (chunk > a_size - offset) chunk = a_size - offset;
+			/* 内部 Flash 可直接读 */
+			memcpy(buf, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
+			if (!bl_w25q128_write(BACKUP_BASE_ADDR + offset, buf, chunk))
+			{
+				log_e("backup write failed @ 0x%08X", offset);
+				return;
+			}
+			offset += chunk;
+		}
+		log_i("backup OK");
+	}
+
 	/* ── 第 1 步：加锁 ── */
-	log_i("Step 1/5: set boot_flag = TESTING (lock)");
+	log_i("Step 2/6: set boot_flag = TESTING (lock)");
 	info->boot_flag = BOOT_FLAG_TESTING;
 	if (!boot_info_write(info))
 	{
@@ -673,7 +704,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	 *  stm32_flash_erase 内部按扇区对齐，不会多擦。 */
 	{
 		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE; /* A区总容量 */
-		log_i("Step 2/5: erase full A area (0x%08X, %u bytes)",
+		log_i("Step 3/6: erase full A area (0x%08X, %u bytes)",
 		      APP_VOTR_ADDR, a_size);
 		stm32_flash_unlock();
 		stm32_flash_erase(APP_VOTR_ADDR, a_size);
@@ -681,7 +712,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	}
 
 	/* ── 第 3 步：搬运 B区 → A区，同步计算 CRC 双向比对 ── */
-	log_i("Step 3/5: copy B -> A (%u bytes), CRC in-pass", info->firmware_len);
+	log_i("Step 4/6: copy B -> A (%u bytes), CRC in-pass", info->firmware_len);
 	uint32_t src_crc = 0;   /* B区读取时累积 */
 	uint32_t dst_crc = 0;   /* A区写入后回读累积 */
 	uint32_t offset  = 0;
@@ -713,7 +744,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	log_i("B->A copy OK, CRC=0x%08X", src_crc);
 
 	/* ── 第 4 步：写入 Magic Header 到 0x0800C000 ── */
-	log_i("Step 4/5: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
+	log_i("Step 5/6: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
 	if (!magic_header_write(APP_VOTR_ADDR, info->firmware_len, src_crc, info->version))
 	{
 		log_e("Magic Header write failed");
@@ -722,8 +753,8 @@ static void boot_perform_upgrade(boot_info_t *info)
 	log_i("Magic Header written OK");
 
 	/* ── 第 5 步：改账本闭环 ── */
-	log_i("Step 5/5: upgrade done, set boot_flag = NORMAL");
-	info->boot_flag    = BOOT_FLAG_NORMAL;
+	log_i("Step 6/6: upgrade done, set boot_flag = PENDING_VERIFY");
+	info->boot_flag    = BOOT_FLAG_PENDING_VERIFY;
 	info->firmware_len = 0;
 	info->firmware_crc = 0;
 	memset(info->version, 0, sizeof(info->version));
@@ -760,17 +791,8 @@ void bootloader_main(void)
 	rx_rb = rb_new(rx_ringbuffer, RX_BUFFER_SIZE);
 	/* 初始化 BL24C512 EEPROM (I2C1: PB6=SCL, PB7=SDA) */
 	bl_eeprom_init();
-//	if (!bl_eeprom_self_test())
-//	{
-//		log_e("EEPROM self-test FAILED");
-//	}
-
 	/* 初始化 W25Q128 外挂 Flash (SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, PE13=CS) */
 	bl_w25q128_init();
-//	if (!bl_w25q128_self_test())
-//	{
-//		log_e("W25Q128 self-test FAILED");
-//	}
 	/* ──── 第一步：验证账本本身有没有坏 ──── */
 	boot_info_t boot_info;
 	if (!boot_info_read(&boot_info))
@@ -778,8 +800,23 @@ void bootloader_main(void)
 		/* CRC 校验失败（两区均坏），已自动使用默认值 (NORMAL) */
 		log_w("boot_info recovered with defaults");
 	}
-//	boot_info_dump(&boot_info);
-	/* ──── 第二步：根据 boot_flag 做出命运判决 ──── */
+	/* ──── 第二步：根据 boot_flag 做出判决 ──── */
+	/* 快速检查 B区有效性：若flag 要求升级但B区为空，清标志走NORMAL */
+	if (boot_info.boot_flag == BOOT_FLAG_NEW_FW ||
+	    boot_info.boot_flag == BOOT_FLAG_TESTING)
+	{
+		uint32_t first_word;
+		bl_w25q128_read(0, (uint8_t *)&first_word, 4);
+		if (first_word == 0xFFFFFFFF || boot_info.firmware_len == 0)
+		{
+			log_w("B area empty, clearing boot_flag to NORMAL");
+			boot_info.boot_flag    = BOOT_FLAG_NORMAL;
+			boot_info.firmware_len = 0;
+			boot_info.firmware_crc = 0;
+			boot_info_write(&boot_info);
+		}
+	}
+
 	switch (boot_info.boot_flag)
 	{
 	case BOOT_FLAG_NORMAL:
@@ -787,6 +824,62 @@ void bootloader_main(void)
 		log_i("Flag: NORMAL -- no firmware update, booting app");
 		boot_normal_mode();
 		break;
+
+	case BOOT_FLAG_PENDING_VERIFY:
+		/* 搬运已完成，等待用户确认 APP 正常。
+		 * 无延时直接跳 APP。若 APP 有问题，用户长按 KEY1 触发回滚。 */
+		log_i("Flag: PENDING_VERIFY -- verifying new APP...");
+		{
+			bool rollback = key_trap_check();  /* 长按 3s = 回滚 */
+			if (rollback)
+			{
+				log_w("KEY1 held: ROLLBACK triggered!");
+				/* 从 W25Q128 备份区恢复旧固件到 A区 */
+				uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE;
+				log_i("Restoring backup from W25Q128@0x%08X...", BACKUP_BASE_ADDR);
+				stm32_flash_unlock();
+				stm32_flash_erase(APP_VOTR_ADDR, a_size);
+				uint8_t *rbuf = (uint8_t *)packet_buffer;
+				for (uint32_t off = 0; off < a_size; off += BUF_SIZE)
+				{
+					uint32_t chunk = BUF_SIZE;
+					if (chunk > a_size - off) chunk = a_size - off;
+					bl_w25q128_read(BACKUP_BASE_ADDR + off, rbuf, chunk);
+					stm32_flash_program(APP_VOTR_ADDR + off, rbuf, chunk);
+				}
+				stm32_flash_lock();
+				/* 回滚完成，清除标志 */
+				boot_info.boot_flag    = BOOT_FLAG_NORMAL;
+				boot_info.firmware_len = 0;
+				boot_info.firmware_crc = 0;
+				memset(boot_info.version, 0, sizeof(boot_info.version));
+				boot_info_write(&boot_info);
+				log_i("Rollback complete, rebooting...");
+				tim_delay_ms(100);
+				NVIC_SystemReset();
+			}
+			else
+			{
+				/* 无按键 → 直接跳 APP */
+				boot_application();
+				/* APP 校验失败 → 进入 UART 模式 */
+				log_w("APP invalid, entering bootloader UART mode");
+				led_on(led1);
+				wait_key_release();
+				while (1)
+				{
+					if (!rb_empty(rx_rb))
+					{
+						uint8_t byte;
+						rb_get(rx_rb, &byte);
+						if (bl_byte_handler(byte))
+							bl_packet_handler();
+					}
+				}
+			}
+		}
+		break;
+
 	case BOOT_FLAG_NEW_FW:
 		/* 有新固件，启动升级施工程序 */
 		log_i("Flag: NEW_FW -- firmware update required, starting upgrade");

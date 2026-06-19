@@ -205,10 +205,11 @@ void boot_info_dump(const boot_info_t *info)
     const char *flag_str;
     switch (info->boot_flag)
     {
-    case BOOT_FLAG_NORMAL:  flag_str = "NORMAL";  break;
-    case BOOT_FLAG_NEW_FW:  flag_str = "NEW_FW";  break;
-    case BOOT_FLAG_TESTING: flag_str = "TESTING";  break;
-    default:                flag_str = "UNKNOWN";  break;
+    case BOOT_FLAG_NORMAL:          flag_str = "NORMAL";          break;
+    case BOOT_FLAG_NEW_FW:          flag_str = "NEW_FW";          break;
+    case BOOT_FLAG_TESTING:         flag_str = "TESTING";         break;
+    case BOOT_FLAG_PENDING_VERIFY:  flag_str = "PENDING_VERIFY";   break;
+    default:                        flag_str = "UNKNOWN";          break;
     }
 
     log_i("-- boot_info -----------------");

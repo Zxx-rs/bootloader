@@ -5,9 +5,15 @@
 #include <stdbool.h>
 
 /* ── OTA 升级状态标志 ── */
-#define BOOT_FLAG_NORMAL      0x00  /* 正常运行，无需升级 */
-#define BOOT_FLAG_NEW_FW      0x01  /* 有新固件需搬运（B区→A区） */
-#define BOOT_FLAG_TESTING     0x02  /* 刚升级完，需运行测试确认 */
+#define BOOT_FLAG_NORMAL           0x00  /* 正常运行，无需升级 */
+#define BOOT_FLAG_NEW_FW           0x01  /* 有新固件需搬运（B区→A区） */
+#define BOOT_FLAG_TESTING          0x02  /* 施工中（防掉电），搬运未完成 */
+#define BOOT_FLAG_PENDING_VERIFY   0x03  /* 搬运完成，等待用户确认 APP 正常 */
+
+/* ── W25Q128 B区备份布局 ──
+ *  0x000000 ~ : 新固件写入区（上位机写入）
+ *  0x800000 ~ : 旧固件备份区（升级前自动备份 A区到此） */
+#define BACKUP_BASE_ADDR      0x800000
 
 /* ── EEPROM 存储布局 ──
  *  0x0000 ~ 0x003F : boot_info_t A区（主标志位，Bootloader 默认读取此区域）

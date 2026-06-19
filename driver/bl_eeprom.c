@@ -23,7 +23,7 @@ static bool i2c_wait_event(uint32_t event)
     {
         if (--timeout == 0)
         {
-            log_e("I2C 事件超时: 0x%08X", event);
+            log_e("I2C event timeout: 0x%08X", event);
             return false;
         }
     }
@@ -168,6 +168,36 @@ static void eeprom_i2c_init(void)
 {
     /* 使能 I2C1 时钟 (可重复调用) */
     RCC_APB1PeriphClockCmd(BL24C512_I2C_CLK, ENABLE);
+
+    /* 软件复位 I2C1 外设，清除 RCC_DeInit 遗留的中间状态 */
+    I2C_DeInit(BL24C512_I2C);
+
+    /* 解锁 I2C 总线: 将 SCL 临时切为 GPIO 输出，发 9 个脉冲释放从机 */
+    {
+        GPIO_InitTypeDef gpio;
+        GPIO_StructInit(&gpio);
+        gpio.GPIO_Pin  = BL24C512_SCL_PIN;
+        gpio.GPIO_Mode = GPIO_Mode_OUT;
+        gpio.GPIO_OType = GPIO_OType_OD;
+        gpio.GPIO_Speed = GPIO_Speed_2MHz;
+        gpio.GPIO_PuPd  = GPIO_PuPd_UP;
+        GPIO_Init(BL24C512_GPIO_PORT, &gpio);
+        for (int i = 0; i < 9; i++)
+        {
+            GPIO_ResetBits(BL24C512_GPIO_PORT, BL24C512_SCL_PIN);
+            for (volatile int d = 0; d < 100; d++);
+            GPIO_SetBits(BL24C512_GPIO_PORT, BL24C512_SCL_PIN);
+            for (volatile int d = 0; d < 100; d++);
+        }
+        /* 恢复 SCL 为 AF 功能 */
+        GPIO_PinAFConfig(BL24C512_GPIO_PORT, BL24C512_SCL_SRC, BL24C512_GPIO_AF);
+        gpio.GPIO_Pin  = BL24C512_SCL_PIN | BL24C512_SDA_PIN;
+        gpio.GPIO_Mode = GPIO_Mode_AF;
+        gpio.GPIO_OType = GPIO_OType_OD;
+        gpio.GPIO_Speed = GPIO_Speed_50MHz;
+        gpio.GPIO_PuPd  = GPIO_PuPd_UP;
+        GPIO_Init(BL24C512_GPIO_PORT, &gpio);
+    }
 
     I2C_InitTypeDef I2C_InitStruct;
     I2C_StructInit(&I2C_InitStruct);
