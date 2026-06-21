@@ -93,6 +93,7 @@ static uint8_t packet_buffer[PACKET_SIZE_MAX];
 static uint32_t packet_index;
 static packet_opcode_t packet_opcode;
 static uint16_t packet_payload_length;
+
 static bool application_validate(void)
 {
 	if (!magic_header_validate())
@@ -592,6 +593,29 @@ bool rx_trap_boot(void)
 	return false;
 }
 
+/* 公用: 进入 BootLoader UART 待命模式 (LED 亮, 等待上位机指令) */
+static void enter_uart_ota_mode(void)
+{
+	led_on(led1);
+	wait_key_release();
+	while (1)
+	{
+		if (key_press_check())
+		{
+			log_w("key pressed, rebooting...");
+			tim_delay_ms(2);
+			NVIC_SystemReset();
+		}
+		if (!rb_empty(rx_rb))
+		{
+			uint8_t byte;
+			rb_get(rx_rb, &byte);
+			if (bl_byte_handler(byte))
+				bl_packet_handler();
+		}
+	}
+}
+
 /* ──────────────────────────────────────────────
  * NORMAL 模式：无固件更新，三步陷入判断后跳转 APP
  * ────────────────────────────────────────────── */
@@ -610,41 +634,21 @@ static void boot_normal_mode(void)
 		trapboot = rx_trap_boot();
 	if (!trapboot)
 		boot_application();
-	/* 停留在 BootLoader UART 模式 */
-	led_on(led1);
-	wait_key_release();
-	while (1)
-	{
-		if (key_press_check())
-		{
-			log_w("key pressed, rebooting...");
-			tim_delay_ms(2);
-			NVIC_SystemReset();
-		}
-		if (!rb_empty(rx_rb))
-		{
-			uint8_t byte;
-			rb_get(rx_rb, &byte);
-			if (bl_byte_handler(byte))
-			{
-				bl_packet_handler();
-			}
-		}
-	}
+	enter_uart_ota_mode();
 }
 
 /* ──────────────────────────────────────────────
-
- * 固件升级施工 — 从暂存区(B区/外挂Flash)搬运到主区(A区/内部Flash)
+ * 固件升级施工 — B区(W25Q128) → A区(内部Flash)
  *
- *  流程:
- *   1. 先将 boot_flag 改为 TESTING (0x02)，防止升级中途断电后
- *      下次启动误跳残废 APP。
- *   2. 擦除主区 (A区) 对应扇区。
- *   3. 从暂存区 (B区) 逐页搬运固件到主区。
- *   4. 搬运完成后 CRC32 全量校验。
- *   5. 校验通过 → boot_flag 改回 NORMAL (0x00)，改账本闭环。
- *   6. 系统复位，下次启动走 NORMAL 模式 → 跳转新 APP。
+ *  Step 1/6: 备份当前 A区到 W25Q128@0x800000 (回滚锚点, 已存在则跳过)
+ *  Step 2/6: flag = TESTING (0x02), 加锁防掉电
+ *  Step 3/6: 擦除全量 A区
+ *  Step 4/6: B→A 分块搬运, 同步 CRC 双向比对
+ *  Step 5/6: magic_header_write() 写入 0x0800C000
+ *  Step 6/6: flag = PENDING_VERIFY (0x03), 等待 APP 确认，NVIC_SystemReset(), 下次启动走判决流程
+ *
+ *  防掉电: Step1 写 TESTING 后任何步骤断电 → 下次启动重做搬运
+ *  回滚:   升级完成但 APP 无法运行时, 长按 KEY4 从备份恢复
  * ────────────────────────────────────────────── */
 
 static void boot_perform_upgrade(boot_info_t *info)
@@ -658,38 +662,48 @@ static void boot_perform_upgrade(boot_info_t *info)
 
 	uint8_t *buf = (uint8_t *)packet_buffer; /* 复用 4KB 协议缓冲区 */
 
-	/* ── 第 0 步：备份当前 A区到 W25Q128（回滚锚点） ── */
+	/* ── 第 1 步：备份当前 A区到 W25Q128（回滚锚点） ── */
 	{
-		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE;
-		log_i("Step 0/6: backup A -> W25Q128@0x%08X (%u bytes)", BACKUP_BASE_ADDR, a_size);
-		/* 先擦除备份区 */
-		for (uint32_t addr = BACKUP_BASE_ADDR; addr < BACKUP_BASE_ADDR + a_size; addr += W25Q128_SECTOR_SIZE)
+		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE;//app size
+
+		/* 检查备份区是否已有数据（跳过重复备份，TESTING 重做时免等待） */
+		uint32_t chk_word;
+		bl_w25q128_read(BACKUP_BASE_ADDR, (uint8_t *)&chk_word, 4);
+		if (chk_word == 0xFFFFFFFF)
 		{
-			if (!bl_w25q128_erase_sector(addr))
+			log_i("Step 1/6: backup A -> W25Q128@0x%08X (%u bytes)", BACKUP_BASE_ADDR, a_size);
+			for (uint32_t addr = BACKUP_BASE_ADDR; addr < BACKUP_BASE_ADDR + a_size; addr += W25Q128_SECTOR_SIZE)
 			{
-				log_e("backup erase failed @ 0x%08X", addr);
-				return;
+				if (!bl_w25q128_erase_sector(addr))
+				{
+					log_e("backup erase failed @ 0x%08X", addr);
+					return;
+				}
 			}
+			uint32_t offset = 0;
+			while (offset < a_size)
+			{
+				uint32_t chunk = BUF_SIZE;
+				if (chunk > a_size - offset) chunk = a_size - offset;
+				memcpy(buf, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
+				if (!bl_w25q128_write(BACKUP_BASE_ADDR + offset, buf, chunk))
+				{
+					log_e("backup write failed @ 0x%08X", offset);
+					return;
+				}
+				offset += chunk;
+			}
+			log_i("backup OK");
 		}
-		/* 分块复制 A区 → W25Q128 */
-		uint32_t offset = 0;
-		while (offset < a_size)
+		else
 		{
-			uint32_t chunk = BUF_SIZE;
-			if (chunk > a_size - offset) chunk = a_size - offset;
-			/* 内部 Flash 可直接读 */
-			memcpy(buf, (uint8_t *)(APP_VOTR_ADDR + offset), chunk);
-			if (!bl_w25q128_write(BACKUP_BASE_ADDR + offset, buf, chunk))
-			{
-				log_e("backup write failed @ 0x%08X", offset);
-				return;
-			}
-			offset += chunk;
+			log_i("Step 1/6: backup already exists, skip");
 		}
-		log_i("backup OK");
 	}
 
-	/* ── 第 1 步：加锁 ── */
+	/* ── 第 2 步：加锁 ── 
+	防掉电，如果断电发生在 Step 3~5 之间，重启后检测到 TESTING 标志仍然存在，
+	继续未完成的升级流程，而不是误跳到残废 APP*/
 	log_i("Step 2/6: set boot_flag = TESTING (lock)");
 	info->boot_flag = BOOT_FLAG_TESTING;
 	if (!boot_info_write(info))
@@ -698,7 +712,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 		return;
 	}
 
-	/* ── 第 2 步：擦除整个 A区 (内部 Flash) ──
+	/* ── 第 3 步：擦除整个 A区 (内部 Flash) ──
 	 *  擦全量而非仅 firmware_len：
 	 *  防止旧固件比新固件大时，尾部残留旧代码。
 	 *  stm32_flash_erase 内部按扇区对齐，不会多擦。 */
@@ -711,7 +725,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 		stm32_flash_lock();
 	}
 
-	/* ── 第 3 步：搬运 B区 → A区，同步计算 CRC 双向比对 ── */
+	/* ── 第 4 步：搬运 B区 → A区，同步计算 CRC 双向比对 ── */
 	log_i("Step 4/6: copy B -> A (%u bytes), CRC in-pass", info->firmware_len);
 	uint32_t src_crc = 0;   /* B区读取时累积 */
 	uint32_t dst_crc = 0;   /* A区写入后回读累积 */
@@ -743,7 +757,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	}
 	log_i("B->A copy OK, CRC=0x%08X", src_crc);
 
-	/* ── 第 4 步：写入 Magic Header 到 0x0800C000 ── */
+	/* ── 第 5 步：写入 Magic Header 到 0x0800C000 ── */
 	log_i("Step 5/6: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
 	if (!magic_header_write(APP_VOTR_ADDR, info->firmware_len, src_crc, info->version))
 	{
@@ -752,7 +766,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	}
 	log_i("Magic Header written OK");
 
-	/* ── 第 5 步：改账本闭环 ── */
+	/* ── 第 6 步：改账本闭环 ── */
 	log_i("Step 6/6: upgrade done, set boot_flag = PENDING_VERIFY");
 	info->boot_flag    = BOOT_FLAG_PENDING_VERIFY;
 	info->firmware_len = 0;
@@ -793,7 +807,7 @@ void bootloader_main(void)
 	bl_eeprom_init();
 	/* 初始化 W25Q128 外挂 Flash (SPI1: PA5=SCK, PA6=MISO, PA7=MOSI, PE13=CS) */
 	bl_w25q128_init();
-	/* ──── 第一步：验证账本本身有没有坏 ──── */
+	/* ──── 第一步：读取OTA标志位 ──── */
 	boot_info_t boot_info;
 	if (!boot_info_read(&boot_info))
 	{
@@ -801,7 +815,7 @@ void bootloader_main(void)
 		log_w("boot_info recovered with defaults");
 	}
 	/* ──── 第二步：根据 boot_flag 做出判决 ──── */
-	/* 快速检查 B区有效性：若flag 要求升级但B区为空，清标志走NORMAL */
+	/* 快速检查B区有效性：若flag 要求升级但B区为空，清标志走NORMAL */
 	if (boot_info.boot_flag == BOOT_FLAG_NEW_FW ||
 	    boot_info.boot_flag == BOOT_FLAG_TESTING)
 	{
@@ -864,18 +878,7 @@ void bootloader_main(void)
 				boot_application();
 				/* APP 校验失败 → 进入 UART 模式 */
 				log_w("APP invalid, entering bootloader UART mode");
-				led_on(led1);
-				wait_key_release();
-				while (1)
-				{
-					if (!rb_empty(rx_rb))
-					{
-						uint8_t byte;
-						rb_get(rx_rb, &byte);
-						if (bl_byte_handler(byte))
-							bl_packet_handler();
-					}
-				}
+				enter_uart_ota_mode();
 			}
 		}
 		break;
@@ -886,36 +889,14 @@ void bootloader_main(void)
 		boot_perform_upgrade(&boot_info);
 		/* 如果升级失败没有复位，降级进入 BootLoader UART 模式 */
 		log_e("Upgrade failed, falling back to bootloader UART mode");
-		led_on(led1);
-		wait_key_release();
-		while (1)
-		{
-			if (!rb_empty(rx_rb))
-			{
-				uint8_t byte;
-				rb_get(rx_rb, &byte);
-				if (bl_byte_handler(byte))
-					bl_packet_handler();
-			}
-		}
+		enter_uart_ota_mode();
 	case BOOT_FLAG_TESTING:
 		/* 上次升级中途断电，重新搬运 */
 		log_w("Flag: TESTING -- previous upgrade was interrupted, redoing...");
 		boot_perform_upgrade(&boot_info);
 		/* 再次失败 → 降级进入 BootLoader UART 模式 */
 		log_e("Recovery upgrade failed, falling back to bootloader UART mode");
-		led_on(led1);
-		wait_key_release();
-		while (1)
-		{
-			if (!rb_empty(rx_rb))
-			{
-				uint8_t byte;
-				rb_get(rx_rb, &byte);
-				if (bl_byte_handler(byte))
-					bl_packet_handler();
-			}
-		}
+		enter_uart_ota_mode();
 	default:
 		log_e("Unknown boot_flag: 0x%08X, treating as NORMAL", boot_info.boot_flag);
 		boot_normal_mode();
