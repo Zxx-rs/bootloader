@@ -20,7 +20,8 @@
             "firmware/driver/inc",
             "third_lib/crc",
             "third_lib/easylogger",
-            "third_lib/ringbuffer"
+            "third_lib/ringbuffer",
+            "third_lib/crypto"
             ],
             "intelliSenseMode": "windows-gcc-arm",
             "name": "bootloader",

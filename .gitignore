@@ -2,3 +2,11 @@ firmware/
 mdk/**
 !mdk/stm32f407.uvoptx
 !mdk/stm32f407.uvprojx
+
+# ECDSA private key — MUST NOT be committed
+private_key.pem
+
+启动流程完整说明.txt
+面试讲述脚本.txt
+固件签名校验方案.txt
+plan_上位机改造指南.txt

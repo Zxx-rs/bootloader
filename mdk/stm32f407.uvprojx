@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F40_41xxx,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>..\app;..\app\inc;..\driver;..\firmware\cmsis\core;..\firmware\cmsis\device;..\firmware\driver\inc;..\third_lib\crc;..\third_lib\ringbuffer;..\third_lib\easylogger</IncludePath>
+              <IncludePath>..\app;..\app\inc;..\driver;..\firmware\cmsis\core;..\firmware\cmsis\device;..\firmware\driver\inc;..\third_lib\crc;..\third_lib\ringbuffer;..\third_lib\easylogger;..\third_lib\crypto</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -413,6 +413,11 @@
               <FileName>boot_info.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\app\boot_info.c</FilePath>
+            </File>
+            <File>
+              <FileName>firmware_sign.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\firmware_sign.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -733,6 +738,21 @@
               <FileName>elog_utils.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\third_lib\easylogger\elog_utils.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>third_lib/crypto</GroupName>
+          <Files>
+            <File>
+              <FileName>sha256.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\third_lib\crypto\sha256.c</FilePath>
+            </File>
+            <File>
+              <FileName>uECC.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\third_lib\crypto\uECC.c</FilePath>
             </File>
           </Files>
         </Group>

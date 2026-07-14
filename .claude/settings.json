@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(dd if=/dev/urandom of=test_fw.bin bs=1024 count=16)",
+      "Bash(python tools/sign_firmware.py test_fw.bin private_key.pem)",
+      "Bash(awk -F: 'NR>=9 && NR<=12')",
+      "Bash(dd if=/dev/urandom of=test_sig.bin bs=1024 count=1)",
+      "Bash(python tools/sign_firmware.py test_sig.bin private_key.pem)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0,'.'\\); exec\\(open\\('test_key.py','w'\\).write\\(''\\)\\); \")",
+      "Bash(python3 test_key.py)",
+      "Bash(rm test_key.py)",
+      "Bash(openssl ec *)",
+      "Bash(python3 tools/sign_firmware.py /tmp/test_fw.bin private_key.pem)",
+      "Bash(python tools/sign_firmware.py /tmp/test_fw.bin private_key.pem)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(dd if=/dev/urandom of=test_tmp.bin bs=1024 count=1)",
+      "Bash(python tools/sign_firmware.py test_tmp.bin private_key.pem)",
+      "Bash(rm test_tmp.bin test_tmp_signed.bin)"
+    ]
+  }
+}

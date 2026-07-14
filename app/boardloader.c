@@ -11,6 +11,7 @@
 #include "tim_delay.h"
 #include "stm32_flash.h"
 #include "magic_header.h"
+#include "firmware_sign.h"
 #include "ringbuffer.h"
 #include "crc16.h"
 #include "crc32.h"
@@ -350,16 +351,26 @@ static void bl_opcode_boot_handler(void)
 /* SET_FLAG: 上位机通知 BootLoader 写入 OTA 标志位
  * Payload: boot_flag(4B) + firmware_len(4B) + firmware_crc(4B) + version(16B) = 28 bytes
  */
+/* SET_FLAG: 上位机通知 BootLoader 写入 OTA 标志位
+ * Payload 支持两种长度:
+ *   28 bytes (无签名, 兼容旧版): flag(4) + len(4) + crc(4) + version(16)
+ *   92 bytes (有签名, 新版):      flag(4) + len(4) + crc(4) + version(16) + signature(64)
+ */
 static void bl_opcode_set_flag_handler(void)
 {
 	log_i("SET_FLAG handler");
-	uint32_t payload_len = sizeof(uint32_t) * 3 + 16;
-	if (packet_payload_length != payload_len)
+	uint32_t min_len  = sizeof(uint32_t) * 3 + 16;             /* 28: no signature */
+	uint32_t full_len = sizeof(uint32_t) * 3 + 16 + FIRMWARE_SIGN_SIZE; /* 92: with sig */
+
+	if (packet_payload_length != min_len && packet_payload_length != full_len)
 	{
-		log_e("SET_FLAG length error: %u != %u", packet_payload_length, payload_len);
+		log_e("SET_FLAG length error: %u (expected %u or %u)",
+		      packet_payload_length, min_len, full_len);
 		bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_PARAM, NULL, 0);
 		return;
 	}
+
+	bool has_signature = (packet_payload_length == full_len);
 
 	uint8_t *p = packet_buffer + PACKET_PAYLOAD_OFFSET;
 	boot_info_t info;
@@ -367,17 +378,38 @@ static void bl_opcode_set_flag_handler(void)
 	info.firmware_len = get_u32_inc(&p);
 	info.firmware_crc = get_u32_inc(&p);
 	memcpy(info.version, p, 16);
-	info.version[15] = '0';
+	info.version[15] = '\0';
 
-	log_i("SET_FLAG: flag=0x%02X, len=%u, crc=0x%08X, ver=%s",
-	      info.boot_flag, info.firmware_len, info.firmware_crc, info.version);
+	log_i("SET_FLAG: flag=0x%02X, len=%u, crc=0x%08X, ver=%s%s",
+	      info.boot_flag, info.firmware_len, info.firmware_crc, info.version,
+	      has_signature ? " [SIGNED]" : "");
 
+	/* 写入 boot_info (B→A 双区) */
 	if (!boot_info_write(&info))
 	{
 		log_e("SET_FLAG: boot_info write failed");
 		bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_, NULL, 0);
 		return;
 	}
+
+	/* 如果有签名, 暂存到 EEPROM (验签在前, 此处只是存储) */
+	if (has_signature)
+	{
+		p += 16; /* skip version, now points at signature */
+		if (!firmware_sign_store(p))
+		{
+			log_e("SET_FLAG: signature store failed");
+			bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_, NULL, 0);
+			return;
+		}
+	}
+	else
+	{
+		/* 兼容模式: 清除签名区 (写 0xFF), 向下兼容旧上位机 */
+		firmware_sign_store(NULL);
+		log_w("SET_FLAG: no signature - upgrade will skip verification");
+	}
+
 	bl_response(PACKET_OPCODE_SET_FLAG, PACKET_ERRCODE_OK, NULL, 0);
 }
 
@@ -640,18 +672,22 @@ static void boot_normal_mode(void)
 /* ──────────────────────────────────────────────
  * 固件升级施工 — B区(W25Q128) → A区(内部Flash)
  *
- *  Step 1/6: 备份当前 A区到 W25Q128@0x800000 (回滚锚点, 已存在则跳过)
- *  Step 2/6: flag = TESTING (0x02), 加锁防掉电
- *  Step 3/6: 擦除全量 A区
- *  Step 4/6: B→A 分块搬运, 同步 CRC 双向比对
- *  Step 5/6: magic_header_write() 写入 0x0800C000
- *  Step 6/6: flag = PENDING_VERIFY (0x03), 等待 APP 确认，NVIC_SystemReset(), 下次启动走判决流程
+ *  Step 0/7: 签名校验 (ECDSA P-256, 可选), 验不过直接拒绝
+ *  Step 1/7: 备份当前 A区到 W25Q128@0x800000 (回滚锚点, 已存在则跳过)
+ *  Step 2/7: flag = TESTING (0x02), 加锁防掉电
+ *  Step 3/7: 擦除全量 A区
+ *  Step 4/7: B→A 分块搬运, 同步 CRC 双向比对
+ *  Step 5/7: magic_header_write() 写入 0x0800C000
+ *  Step 6/7: flag = PENDING_VERIFY (0x03), 等待 APP 确认，NVIC_SystemReset(), 下次启动走判决流程
  *
- *  防掉电: Step1 写 TESTING 后任何步骤断电 → 下次启动重做搬运
- *  回滚:   升级完成但 APP 无法运行时, 长按 KEY4 从备份恢复
+ *  防掉电: Step2 写 TESTING 后任何步骤断电 → 下次启动重做搬运
+ *  回滚:   升级完成但 APP 无法运行时, 长按 KEY1 从备份恢复
+ *
+ * @param  info       boot_info (firmware metadata + OTA flag)
+ * @param  signature  64-byte ECDSA signature, or NULL/0xFF to skip check
  * ────────────────────────────────────────────── */
 
-static void boot_perform_upgrade(boot_info_t *info)
+static void boot_perform_upgrade(boot_info_t *info, const uint8_t *signature)
 {
 	log_i("=== Firmware upgrade started ===");
 	log_i("  version: %s, size: %u, CRC: 0x%08X",
@@ -662,6 +698,27 @@ static void boot_perform_upgrade(boot_info_t *info)
 
 	uint8_t *buf = (uint8_t *)packet_buffer; /* 复用 4KB 协议缓冲区 */
 
+	/* ── 第 0 步：签名校验 (在备份/擦除之前, 验不过直接拒绝) ── */
+	if (signature != NULL && firmware_sign_is_present(signature))
+	{
+		log_i("Step 0/7: verify firmware signature...");
+		if (!firmware_sign_verify(signature, info->firmware_len, buf))
+		{
+			log_e("SIGNATURE VERIFICATION FAILED - firmware rejected!");
+			/* 清除 OTA 标志, 防止下次启动再次尝试 */
+			info->boot_flag = BOOT_FLAG_NORMAL;
+			info->firmware_len = 0;
+			info->firmware_crc = 0;
+			memset(info->version, 0, sizeof(info->version));
+			boot_info_write(info);
+			return;
+		}
+	}
+	else
+	{
+		log_w("Step 0/7: no signature present - skipping verification");
+	}
+
 	/* ── 第 1 步：备份当前 A区到 W25Q128（回滚锚点） ── */
 	{
 		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE;//app size
@@ -671,7 +728,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 		bl_w25q128_read(BACKUP_BASE_ADDR, (uint8_t *)&chk_word, 4);
 		if (chk_word == 0xFFFFFFFF)
 		{
-			log_i("Step 1/6: backup A -> W25Q128@0x%08X (%u bytes)", BACKUP_BASE_ADDR, a_size);
+			log_i("Step 1/7: backup A -> W25Q128@0x%08X (%u bytes)", BACKUP_BASE_ADDR, a_size);
 			for (uint32_t addr = BACKUP_BASE_ADDR; addr < BACKUP_BASE_ADDR + a_size; addr += W25Q128_SECTOR_SIZE)
 			{
 				if (!bl_w25q128_erase_sector(addr))
@@ -697,14 +754,14 @@ static void boot_perform_upgrade(boot_info_t *info)
 		}
 		else
 		{
-			log_i("Step 1/6: backup already exists, skip");
+			log_i("Step 1/7: backup already exists, skip");
 		}
 	}
 
 	/* ── 第 2 步：加锁 ── 
 	防掉电，如果断电发生在 Step 3~5 之间，重启后检测到 TESTING 标志仍然存在，
 	继续未完成的升级流程，而不是误跳到残废 APP*/
-	log_i("Step 2/6: set boot_flag = TESTING (lock)");
+	log_i("Step 2/7: set boot_flag = TESTING (lock)");
 	info->boot_flag = BOOT_FLAG_TESTING;
 	if (!boot_info_write(info))
 	{
@@ -718,7 +775,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	 *  stm32_flash_erase 内部按扇区对齐，不会多擦。 */
 	{
 		uint32_t a_size = STM32_FLASH_SIZE - BL_SIZE; /* A区总容量 */
-		log_i("Step 3/6: erase full A area (0x%08X, %u bytes)",
+		log_i("Step 3/7: erase full A area (0x%08X, %u bytes)",
 		      APP_VOTR_ADDR, a_size);
 		stm32_flash_unlock();
 		stm32_flash_erase(APP_VOTR_ADDR, a_size);
@@ -726,7 +783,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	}
 
 	/* ── 第 4 步：搬运 B区 → A区，同步计算 CRC 双向比对 ── */
-	log_i("Step 4/6: copy B -> A (%u bytes), CRC in-pass", info->firmware_len);
+	log_i("Step 4/7: copy B -> A (%u bytes), CRC in-pass", info->firmware_len);
 	uint32_t src_crc = 0;   /* B区读取时累积 */
 	uint32_t dst_crc = 0;   /* A区写入后回读累积 */
 	uint32_t offset  = 0;
@@ -758,7 +815,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	log_i("B->A copy OK, CRC=0x%08X", src_crc);
 
 	/* ── 第 5 步：写入 Magic Header 到 0x0800C000 ── */
-	log_i("Step 5/6: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
+	log_i("Step 5/7: write Magic Header to 0x%08X", MAGIC_HEADER_ADDR);
 	if (!magic_header_write(APP_VOTR_ADDR, info->firmware_len, src_crc, info->version))
 	{
 		log_e("Magic Header write failed");
@@ -767,7 +824,7 @@ static void boot_perform_upgrade(boot_info_t *info)
 	log_i("Magic Header written OK");
 
 	/* ── 第 6 步：改账本闭环 ── */
-	log_i("Step 6/6: upgrade done, set boot_flag = PENDING_VERIFY");
+	log_i("Step 6/7: upgrade done, set boot_flag = PENDING_VERIFY");
 	info->boot_flag    = BOOT_FLAG_PENDING_VERIFY;
 	info->firmware_len = 0;
 	info->firmware_crc = 0;
@@ -886,14 +943,36 @@ void bootloader_main(void)
 	case BOOT_FLAG_NEW_FW:
 		/* 有新固件，启动升级施工程序 */
 		log_i("Flag: NEW_FW -- firmware update required, starting upgrade");
-		boot_perform_upgrade(&boot_info);
+		log_i("Hold KEY1 to skip upgrade and enter UART mode...");
+		if (key_trap_check())
+		{
+			log_w("KEY1 held, skipping upgrade");
+			enter_uart_ota_mode();
+		}
+		{
+		uint8_t fw_signature[FIRMWARE_SIGN_SIZE];
+		firmware_sign_read(fw_signature);
+		boot_perform_upgrade(&boot_info, fw_signature);
+		}
 		/* 如果升级失败没有复位，降级进入 BootLoader UART 模式 */
 		log_e("Upgrade failed, falling back to bootloader UART mode");
 		enter_uart_ota_mode();
 	case BOOT_FLAG_TESTING:
 		/* 上次升级中途断电，重新搬运 */
 		log_w("Flag: TESTING -- previous upgrade was interrupted, redoing...");
-		boot_perform_upgrade(&boot_info);
+		log_i("Hold KEY1 to skip upgrade and enter UART mode...");
+		if (key_trap_check())
+		{
+			log_w("KEY1 held, skipping upgrade");
+			boot_info.boot_flag = BOOT_FLAG_NORMAL;
+			boot_info_write(&boot_info);
+			enter_uart_ota_mode();
+		}
+		{
+			uint8_t fw_signature[FIRMWARE_SIGN_SIZE];
+			firmware_sign_read(fw_signature);
+			boot_perform_upgrade(&boot_info, fw_signature);
+		}
 		/* 再次失败 → 降级进入 BootLoader UART 模式 */
 		log_e("Recovery upgrade failed, falling back to bootloader UART mode");
 		enter_uart_ota_mode();

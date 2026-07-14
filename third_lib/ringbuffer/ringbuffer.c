@@ -15,6 +15,8 @@ rb_t rb_new(uint8_t *buffer, uint16_t length)
     if (length < sizeof(struct ringbuffer) + 1)
         return NULL; // 缓冲区太小，无法容纳ringbuffer结构
 
+//前几个字节（控制头）：被强制解释成了struct ringbuffer。C语言编译器会自动去对齐、去认领 head、tail 和 size 应该占用的前几个字节物理坑位。
+//后面的字节（数据仓库）：紧跟在结构体屁股后面的剩余空间（即 100 - sizeof(struct ringbuffer) 字节），被用作真正的环形队列存储区。
     rb_t rb = (rb_t)buffer;
     rb->head = 0;
     rb->tail = 0;

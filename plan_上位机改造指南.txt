@@ -53,49 +53,94 @@
     SET_FLAG = 0x84,  // 写入 OTA 标志位到 EEPROM
 
 ----------------------------------------------------------------------
-  3.2 新增 SetFlag() 公共方法
+  3.2 新增 SetFlag() 公共方法 (支持固件签名校验)
 ----------------------------------------------------------------------
 
   在 Transfer.cs 中其他公共方法（如 Boot()）旁边添加。
   超时建议 10 秒（涉及 EEPROM 双区写入）。
 
-  方法签名和逻辑（C# 代码）：
+  【方案B: 签名由 Python 离线脚本完成，上位机只负责拆分和下发】
 
-    public bool SetFlag(uint firmwareLen, uint firmwareCrc, string version)
+  ┌──────────────────────────────────────────────────────────────┐
+  │ 发布流程 (开发PC上, 每次发布新固件时执行一次):                 │
+  │                                                              │
+  │   python tools/sign_firmware.py firmware.bin private_key.pem  │
+  │                                                              │
+  │   输入: firmware.bin + private_key.pem                        │
+  │   输出: firmware_signed.bin (原固件 + 64B签名拼接)            │
+  │                                                              │
+  │ 上位机读取 firmware_signed.bin:                               │
+  │   - 前 N-64 字节 = 固件数据 → PROGRAM 下发                    │
+  │   - 后 64 字节  = ECDSA签名 → SET_FLAG 下发                   │
+  └──────────────────────────────────────────────────────────────┘
+
+  【上位机侧 SetFlag() — 保持不变，签名来自文件末尾】
+
+    public bool SetFlag(uint firmwareLen, uint firmwareCrc,
+                         string version, byte[]? signature = null)
     {
-        // 1. 构造 28 字节 payload
-        byte[] param = new byte[28];
+        bool hasSignature = (signature != null && signature.Length == 64);
+        int payloadLen = hasSignature ? 92 : 28;
+        byte[] param = new byte[payloadLen];
 
-        // boot_flag = 0x01 (NEW_FW), uint32 LE, offset 0
-        BitConverter.GetBytes((uint)1).CopyTo(param, 0);
-
-        // firmware_len, uint32 LE, offset 4
+        BitConverter.GetBytes((uint)1).CopyTo(param, 0);      // boot_flag=NEW_FW
         BitConverter.GetBytes(firmwareLen).CopyTo(param, 4);
-
-        // firmware_crc, uint32 LE, offset 8
         BitConverter.GetBytes(firmwareCrc).CopyTo(param, 8);
 
-        // version 字符串, 16 bytes ASCII, offset 12
-        // 截断到 15 字符 + '\0', 不足补 '\0'
         byte[] verBytes = new byte[16];
         byte[] srcBytes = Encoding.ASCII.GetBytes(version ?? "0.0.0");
         int copyLen = Math.Min(srcBytes.Length, 15);
         Array.Copy(srcBytes, 0, verBytes, 0, copyLen);
         Array.Copy(verBytes, 0, param, 12, 16);
 
-        // 2. 组帧并发送
+        if (hasSignature)
+            Array.Copy(signature, 0, param, 28, 64);  // 64字节签名, offset 28
+
         byte[] packet = BuildPacket(OPCODE.SET_FLAG, param);
         if (!PacketRequest(packet, out byte[]? response, timeout_ms: 10000))
             return false;
-
-        // 3. 校验响应 (response[2] == 0x00 表示成功)
         return response != null && response.Length >= 3 && response[2] == 0x00;
     }
 
+  【Form1.cs — 读取 signed firmware 并拆分】
+
+    // 读取 signed 固件文件
+    byte[] signedFirmware = File.ReadAllBytes("firmware_signed.bin");
+
+    // 提取签名 (末尾 64 字节)
+    byte[]? signature = null;
+    bool hasSignature = signedFirmware.Length >= 64;
+    if (hasSignature)
+    {
+        byte[] sigCheck = new byte[64];
+        Array.Copy(signedFirmware, signedFirmware.Length - 64, sigCheck, 0, 64);
+        // 检查是否为全 0xFF (未签名的标记)
+        bool allFF = true;
+        for (int i = 0; i < 64; i++)
+            if (sigCheck[i] != 0xFF) { allFF = false; break; }
+        if (!allFF)
+            signature = sigCheck;
+    }
+
+    // 固件数据 (去掉末尾 64 字节签名)
+    int fwLen = hasSignature ? signedFirmware.Length - 64 : signedFirmware.Length;
+    byte[] firmware = new byte[fwLen];
+    Array.Copy(signedFirmware, 0, firmware, 0, fwLen);
+
+    // 正常下发固件...
+    transfer.Erase(B_AREA_ADDR, firmware.Length);
+    transfer.Program(B_AREA_ADDR, firmware, mtu);
+    uint crc = CRC.CRC32(firmware);
+    transfer.Verify(B_AREA_ADDR, firmware.Length, crc);
+
+    // 下发标志位 (含签名)
+    transfer.SetFlag((uint)firmware.Length, crc, version, signature);
+
   说明：
-  - BitConverter.GetBytes 在 Windows 上返回小端字节序，与 ARM Cortex-M4 一致
-  - Encoding.ASCII.GetBytes 将 C# 字符串转为 ASCII 字节数组
-  - BuildPacket 内部自动调用 CRC.CRC16 计算校验和
+  - 上位机不再需要 private_key.pem 或加密库依赖
+  - 签名由开发者用 sign_firmware.py 离线生成
+  - 若固件文件不带签名(长度不包含64B后缀), signature=null → 28B兼容模式
+  - 私钥只存在于开发PC, 产线/现场的上位机绝不接触私钥
 
 
 ================================================================================
