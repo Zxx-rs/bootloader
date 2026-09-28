@@ -628,6 +628,24 @@ bool rx_trap_boot(void)
 /* 公用: 进入 BootLoader UART 待命模式 (LED 亮, 等待上位机指令) */
 static void enter_uart_ota_mode(void)
 {
+	/* 恢复 USART3 接收中断。
+	 * boot_perform_upgrade() 入口关掉了 RXNE 中断，而它所有失败分支都是直接
+	 * return，不会恢复。本函数靠轮询 rx_rb 收数据，rx_rb 只由 USART3 中断填充
+	 * —— 不重新打开中断，这里就会永远轮询一个填不满的缓冲区，表现为上位机
+	 * "WaitResponse timeout / 无法连接到引导程序"。
+	 * 放在这个唯一汇合点恢复，一次覆盖全部入口，而不是去堵
+	 * boot_perform_upgrade() 的每一个 return。 */
+	USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+
+	/* 中断关闭期间 DR 未被读取，收到第二个字节就会置起 ORE。RM0090 规定的清除
+	 * 序列是"读 SR 再读 DR"，USART_ClearFlag() 清不掉 ORE。
+	 * ORE 置位说明数据已经丢失，此处读出的 DR 是升级期间的残留，直接丢弃。
+	 * 用 if 守卫：正常模式下 ORE 不置位，不会误吞有效字节。 */
+	if (USART_GetFlagStatus(USART3, USART_FLAG_ORE) != RESET)
+	{
+		(void)USART_ReceiveData(USART3);
+	}
+
 	led_on(led1);
 	wait_key_release();
 	while (1)
