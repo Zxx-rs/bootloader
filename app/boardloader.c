@@ -21,7 +21,7 @@
 #define LOG_LVL ELOG_LVL_INFO
 
 #include "elog.h"
-#define BL_VERSION "0.0.1"
+#define BL_VERSION "0.0.2"
 #define BL_ADDRESS 0x08000000
 #define BL_SIZE (48 * 1024)
 #define BOOT_DELAY 3000
@@ -354,7 +354,7 @@ static void bl_opcode_boot_handler(void)
 /* SET_FLAG: 上位机通知 BootLoader 写入 OTA 标志位
  * Payload 支持两种长度:
  *   28 bytes (无签名, 兼容旧版): flag(4) + len(4) + crc(4) + version(16)
- *   92 bytes (有签名, 新版):      flag(4) + len(4) + crc(4) + version(16) + signature(64)
+ *   92 bytes (有签名, 新版):    flag(4) + len(4) + crc(4) + version(16) + signature(64)
  */
 static void bl_opcode_set_flag_handler(void)
 {
@@ -714,6 +714,7 @@ static void boot_perform_upgrade(boot_info_t *info, const uint8_t *signature)
 			return;
 		}
 	}
+	
 	else
 	{
 		log_w("Step 0/7: no signature present - skipping verification");
